@@ -131,6 +131,7 @@ The response is Ollaya's native decide response, with the student's typed answer
   "addita": {
     "id": "3f2a9c1e-…",
     "ref": "lume-run-7c1e…",
+    "group": "lume-run-7c1e…",
     "final": { "rows_answer_question": true, "answer_supported": true },
     "source": "teacher",
     "teacher": "answered",
@@ -144,6 +145,7 @@ The response is Ollaya's native decide response, with the student's typed answer
 - `final` is the effective decision, with the teacher and guards applied. Read this one. A caller that reads only `answers` gets the student's view, not Addita's decision: the shapes are compatible, but the decisions can differ.
 - `teacher` is `answered`, `pending` (offline, waiting for backfill), `skipped` or `failed`. `teacher_model` and `teacher_host` name the teacher that actually answered, and `student_ms` / `teacher_ms` give the time for each.
 - `ref` is echoed from the request, and carried on Addita's OTLP records.
+- `group` (optional, `addita.group`) ties related decisions together so exports never split them between train and eval. It defaults to `ref`, then the decision id.
 - `GET /api/addita/decision/{id}` returns a decision's current state. `POST /api/addita/label` with `{id, labels}` records a correction.
 - Errors use Ollaya's shape and codes: `{"error": "…", "code": "INVALID_REQUEST"}`.
 
@@ -158,7 +160,7 @@ The response is Ollaya's native decide response, with the student's typed answer
 | `training_stats` | Counts, guard hits and per-question agreement: student vs teacher, and both vs your labels. |
 | `training_disagreements` | Unlabelled rows where student and teacher disagree. Label these first. |
 | `training_backfill` | The teacher is back: answer the rows it missed. |
-| `training_export` | Writes `train.jsonl` and `eval.jsonl` under `exports/<time>/`. |
+| `training_export` | Writes `train.jsonl`, `eval.jsonl`, `calibration.jsonl` and `manifest.json` under `exports/<time>/`, split by group. |
 | `training_calibrate` | Temperature-scales the student's probabilities against your labels; can bake the result into a new Ollaya model. |
 | `ollama_chat` | Simplified proxy to Ollama `/api/chat` (selected inputs and outputs, not wire-identical). Not logged. |
 | `backends_status`, `ollaya_pull`, `presets_show` | Housekeeping. |
@@ -198,8 +200,13 @@ This assumes a running Shivvr (default `http://localhost:8085`).
 2. **Label the disagreements.** `training_disagreements` → `comms_label`. A few minutes a day covers it.
 3. **Watch `training_stats`.** When `student_accuracy_vs_human` matches `teacher_accuracy_vs_human` on a question, the student can own that question.
 4. **Calibrate.** `training_calibrate` fits a temperature per bucket from human labels (about 30 per bucket). Add `create_model` to bake it into a new Ollaya model.
-5. **Fine-tune if calibration isn't enough.** `training_export` gives `train.jsonl` (human labels first, teacher labels second; the student never labels itself) and `eval.jsonl` (the human-labelled rows). Fine-tune upstream, package into Ollaya, and score only on `eval.jsonl`.
-   - **Caveat:** today, questions you didn't correct on an `eval.jsonl` row still carry the teacher's label (`label_source` says which). Score only the human-sourced labels. Making `eval.jsonl` human-only is in progress.
+5. **Fine-tune if calibration isn't enough.** `training_export` writes:
+   - `eval.jsonl`: only the questions a human labelled, nothing else. Score on this.
+   - `train.jsonl`: labels in order human, then guard, then teacher; the student never labels itself. Each question's `label_source` says which. A guard-forced answer is marked `"guard"`, with `guard_overrides` naming the guard and `teacher_labels` keeping the teacher's original answer.
+   - `calibration.jsonl` (when `calibration_fraction` > 0): same shape as train.
+   - `manifest.json`: schema version, fractions, split rule and counts.
+
+   Rows are split by `sha256(group)`. `group` is `addita.group` from the request, else `ref`, else the decision id. A group never lands in two files, and rows without a human label in an eval group are held out rather than trained. Fine-tune upstream, package into Ollaya, and score only on `eval.jsonl`.
 
 ### Things to know
 
@@ -258,7 +265,7 @@ This assumes a running Shivvr (default `http://localhost:8085`).
 | OTLP logging to `lume serve` | ✅ against a mock collector · ⏳ not yet against a live `lume serve` |
 | Guards and logging on HTTP when both models are down | ✅ |
 | Guards and logging on MCP when `teacher: require` fails | 🚧 deferred |
-| Human-only `eval.jsonl`; guard-overridden teacher labels marked in exports | 🚧 in progress |
+| Training export: human-only `eval.jsonl`, guard-marked labels, grouped train/eval/calibration split, `manifest.json` | ✅ smoke tests pass |
 | Fine-tuning pipeline (Laya, Cloud Run) | 🔬 research |
 
 ## Development
