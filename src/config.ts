@@ -41,7 +41,7 @@ export const config = {
   ollamaUrl: (env.OLLAMA_URL ?? "http://127.0.0.1:11434").replace(/\/+$/, ""),
   /** Primary (cloud by default) teacher model. */
   ollamaModel: env.OLLAMA_MODEL ?? "deepseek-v4.1-flash:cloud",
-  /** Local fallback teacher model used when cloud is disallowed or fails. */
+  /** Local fallback teacher model used when cloud fails or ADDITA_NO_CLOUD=true. */
   ollamaLocalModel: env.OLLAMA_LOCAL_MODEL !== undefined ? env.OLLAMA_LOCAL_MODEL : "qwen3.5:4b",
   ollamaTimeoutMs: num("OLLAMA_TIMEOUT_MS", 120_000),
   /** Pass `think` to Ollama only when set; teacher calls default to think:false so reasoning models don't stall or break JSON schema. */
@@ -58,8 +58,8 @@ export const config = {
   teacherMode: (env.ADDITA_TEACHER ?? "auto") as TeacherMode,
   /** When true the teacher is shown the student's answers (biases labels; off by default). */
   teacherSeesStudent: bool("ADDITA_TEACHER_SEES_STUDENT") ?? false,
-  /** Whether a cloud or non-local Ollama teacher is allowed (default true / 1). */
-  allowCloudTeacher: bool("ADDITA_ALLOW_CLOUD_TEACHER") ?? true,
+  /** When true (ADDITA_NO_CLOUD), never send anything to a cloud teacher, including backfill (default false). */
+  noCloud: bool("ADDITA_NO_CLOUD") ?? false,
 
   dataDir: resolve(env.ADDITA_DATA_DIR ?? join(homedir(), ".addita")),
   presetsDir: resolve(env.ADDITA_PRESETS_DIR ?? join(here, "..", "presets")),

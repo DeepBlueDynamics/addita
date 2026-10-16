@@ -3,6 +3,7 @@ import { requestJson } from "./http.js";
 import type { Questions } from "./questions.js";
 
 export interface CalibrationSpec {
+  temperature?: number[];
   temperature_by_options?: Record<string, number>;
   noul_threshold?: number;
 }
@@ -12,13 +13,38 @@ export const headers = (): Record<string, string> =>
 
 export const url = (p: string) => `${config.ollayaUrl}${p}`;
 
+let lastOnline: boolean | undefined;
+
+export function isKnownOnline(): boolean | undefined {
+  return lastOnline;
+}
+
+export function setKnownOnline(online: boolean): void {
+  lastOnline = online;
+}
+
+async function trackedRequest<T = any>(path: string, opts: Parameters<typeof requestJson>[1]): Promise<T> {
+  try {
+    const res = await requestJson<T>(url(path), opts);
+    lastOnline = true;
+    return res;
+  } catch (e: any) {
+    if (e?.status !== undefined) {
+      lastOnline = true;
+    } else {
+      lastOnline = false;
+    }
+    throw e;
+  }
+}
+
 export interface DecideResponse {
   model: string;
   answers: Record<string, any>;
   usage?: { input_tokens: number; output_tokens: number };
   routing?: unknown;
   state_truncated?: boolean;
-  done_reason?: string;
+  done_reason?: "decide" | "load" | "unload";
   created_at?: string;
   total_duration?: number;
   load_duration?: number;
@@ -42,7 +68,7 @@ export function decide(
     typeof keepAliveOrOpts === "object" && keepAliveOrOpts !== null
       ? keepAliveOrOpts
       : { keepAlive: keepAliveOrOpts };
-  return requestJson<DecideResponse>(url("/api/decide"), {
+  return trackedRequest<DecideResponse>("/api/decide", {
     body: {
       model,
       ...(state !== undefined ? { state } : {}),
@@ -57,7 +83,7 @@ export function decide(
 }
 
 export function show(model: string, verbose = false) {
-  return requestJson<any>(url("/api/show"), {
+  return trackedRequest<any>("/api/show", {
     body: { model, verbose },
     headers: headers(),
     timeoutMs: config.ollayaTimeoutMs,
@@ -65,7 +91,7 @@ export function show(model: string, verbose = false) {
 }
 
 export function presetShow(name: string) {
-  return requestJson<any>(url("/api/presets/show"), {
+  return trackedRequest<any>("/api/presets/show", {
     body: { name },
     headers: headers(),
     timeoutMs: config.ollayaTimeoutMs,
@@ -74,9 +100,9 @@ export function presetShow(name: string) {
 
 export async function status() {
   const [version, tags, ps] = await Promise.all([
-    requestJson(url("/api/version"), { headers: headers(), timeoutMs: 3000 }),
-    requestJson(url("/api/tags"), { headers: headers(), timeoutMs: 3000 }),
-    requestJson(url("/api/ps"), { headers: headers(), timeoutMs: 3000 }),
+    trackedRequest("/api/version", { headers: headers(), timeoutMs: 3000 }),
+    trackedRequest("/api/tags", { headers: headers(), timeoutMs: 3000 }),
+    trackedRequest("/api/ps", { headers: headers(), timeoutMs: 3000 }),
   ]);
   return {
     url: config.ollayaUrl,
@@ -104,7 +130,9 @@ export function create(body: {
   from: string;
   questions?: Questions;
   calibration?: Record<string, unknown>;
+  parameters?: { precision?: "fp16" | "fp32" };
   description?: string;
+  license?: string | string[];
 }) {
   return requestJson(url("/api/create"), {
     body: { ...body, stream: false },

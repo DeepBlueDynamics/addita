@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "./config.js";
+import { HttpError } from "./http.js";
 import * as ollaya from "./ollaya.js";
 import * as ollama from "./ollama.js";
 import * as lume from "./lume.js";
@@ -15,7 +16,13 @@ import {
   type SimpleAnswers,
 } from "./questions.js";
 import { store, type DecisionRow, type TeacherRow } from "./store.js";
-import { ApiError, type ValidatedDecideRequest, type ValidatedV1Request } from "./validate.js";
+import {
+  ApiError,
+  defaultCodeForStatus,
+  type ErrorCode,
+  type ValidatedDecideRequest,
+  type ValidatedV1Request,
+} from "./validate.js";
 
 // ---------------------------------------------------------------- presets
 
@@ -90,6 +97,28 @@ function extractNoulScores(questions: Questions, rawAnswers: Record<string, any>
   return out;
 }
 
+function httpErrorToApiError(e: any, model?: string): ApiError {
+  if (e instanceof ApiError) return e;
+  if (e instanceof HttpError && e.status !== undefined) {
+    if (e.status === 404 && (!e.code || e.code === "MODEL_NOT_FOUND") && model) {
+      return ApiError.modelNotFound(model);
+    }
+    const code = (e.code ?? defaultCodeForStatus(e.status)) as ErrorCode;
+    return new ApiError(
+      e.status,
+      {
+        error: e.rawError ?? e.message,
+        code,
+        ...(e.detail ? { detail: e.detail as any } : {}),
+      },
+      e.headers,
+    );
+  }
+  return ApiError.backendUnavailable(
+    `cannot reach Ollaya at ${config.ollayaUrl}: ${e?.message ?? String(e)}`,
+  );
+}
+
 // ---------------------------------------------------------------- teacher
 
 const SYSTEM = `You are labelling radio and message traffic to train a small decision model.
@@ -159,27 +188,36 @@ async function askTeacher(
   };
 }
 
+/**
+ * Runs teacher inference following Kord's rules:
+ * - If `ADDITA_NO_CLOUD=true`: never call cloud; only local (`qwen3.5:4b`) is used.
+ * - If `ADDITA_NO_CLOUD=false`: try cloud teacher (`deepseek-v4.1-flash:cloud`) first.
+ *   If cloud fails for any reason, local teacher (`qwen3.5:4b`) answers immediately and
+ *   marks the row `cloud_pending: true` so `backfill` re-asks the cloud when it is back.
+ */
 async function runTeacherWithFallback(
   id: string,
   state: unknown,
   questions: Questions,
   studentSimple: SimpleAnswers | undefined,
-  allowCloud: boolean,
   forceSkip: boolean,
+  onlyCloud = false,
 ): Promise<{
   teacher?: TeacherRow;
   status: string;
   wireState: "answered" | "pending" | "skipped" | "failed";
   teacherModel: string;
   teacherHost: string;
+  cloudPending: boolean;
 }> {
-  const { candidates, defaultInfo } = await ollama.resolveTeacherCandidates(allowCloud);
+  const { candidates, defaultInfo, hadCloudPrimary } = await ollama.resolveTeacherCandidates({ onlyCloud });
   if (forceSkip || candidates.length === 0) {
     return {
       status: "skipped",
       wireState: "skipped",
       teacherModel: defaultInfo.model,
       teacherHost: defaultInfo.host,
+      cloudPending: false,
     };
   }
   if (!(await ollama.isOnline())) {
@@ -188,18 +226,22 @@ async function runTeacherWithFallback(
       wireState: "pending",
       teacherModel: defaultInfo.model,
       teacherHost: defaultInfo.host,
+      cloudPending: hadCloudPrimary,
     };
   }
   let lastError = "unknown error";
   let lastCandidate = defaultInfo;
+  let cloudFailed = false;
   for (const cand of candidates) {
     lastCandidate = cand;
     try {
       const t = await askTeacher(state, questions, studentSimple, cand);
+      const isCloudFallback = hadCloudPrimary && cloudFailed && !cand.isCloud;
       const row: TeacherRow = {
         id,
         ts: new Date().toISOString(),
         backfill: false,
+        cloud_pending: isCloudFallback,
         ...t,
       };
       return {
@@ -208,8 +250,10 @@ async function runTeacherWithFallback(
         wireState: "answered",
         teacherModel: row.model,
         teacherHost: row.host ?? cand.host,
+        cloudPending: isCloudFallback,
       };
     } catch (e: any) {
+      if (cand.isCloud) cloudFailed = true;
       lastError = e?.message ?? String(e);
     }
   }
@@ -220,6 +264,7 @@ async function runTeacherWithFallback(
       wireState: "pending",
       teacherModel: lastCandidate.model,
       teacherHost: lastCandidate.host,
+      cloudPending: hadCloudPrimary,
     };
   }
   return {
@@ -227,6 +272,7 @@ async function runTeacherWithFallback(
     wireState: "failed",
     teacherModel: lastCandidate.model,
     teacherHost: lastCandidate.host,
+    cloudPending: hadCloudPrimary,
   };
 }
 
@@ -242,7 +288,6 @@ export interface DecideInput {
   /** Pull related past traffic from Lume into the context (default on when Lume is available). */
   lume_context?: boolean;
   ref?: string;
-  allow_cloud_teacher?: boolean;
 }
 
 /**
@@ -331,13 +376,15 @@ export async function decide(input: DecideInput) {
     studentError = e.message;
   }
 
-  // 2. teacher (cloud -> local fallback)
-  const allowCloud = input.allow_cloud_teacher ?? config.allowCloudTeacher;
+  // 2. teacher (cloud -> local fallback, governed solely by ADDITA_NO_CLOUD)
   const mode = input.teacher ?? (config.teacherMode === "off" ? "skip" : config.teacherMode === "always" ? "require" : "auto");
-  const tOut = await runTeacherWithFallback(id, state, questions, student?.simple, allowCloud, mode === "skip");
+  const t0 = Date.now();
+  const tOut = await runTeacherWithFallback(id, state, questions, student?.simple, mode === "skip");
   const teacher = tOut.teacher;
   const teacherStatus = tOut.status;
   const wireTeacherState = tOut.wireState;
+  const studentMs = student?.latency_ms ?? (Date.now() - s0);
+  const teacherMs = wireTeacherState === "skipped" ? 0 : (teacher?.latency_ms ?? (Date.now() - t0));
 
   if (mode === "require" && !teacher) throw new Error(`teacher required but ${teacherStatus}`);
 
@@ -367,6 +414,9 @@ export async function decide(input: DecideInput) {
     teacher_status: wireTeacherState,
     teacher_model: tOut.teacherModel,
     teacher_host: tOut.teacherHost,
+    ...(tOut.cloudPending ? { cloud_pending: true } : {}),
+    student_ms: studentMs,
+    teacher_ms: teacherMs,
     final: g.answers,
     final_source: source,
     guards: g.hits,
@@ -419,7 +469,14 @@ export async function decide(input: DecideInput) {
         }
       : { error: studentError },
     teacher: teacher
-      ? { model: teacher.model, host: teacher.host, answers: teacher.answers, reasons: teacher.reasons, latency_ms: teacher.latency_ms }
+      ? {
+          model: teacher.model,
+          host: teacher.host,
+          answers: teacher.answers,
+          reasons: teacher.reasons,
+          latency_ms: teacher.latency_ms,
+          ...(teacher.cloud_pending ? { cloud_pending: true } : {}),
+        }
       : { status: teacherStatus },
     agreement,
     lume: (await lume.version())
@@ -442,15 +499,6 @@ function stripLayaExtra(answers: Record<string, any>, keepLaya: boolean): Record
     }
   }
   return out;
-}
-
-function isUnloadKeepAlive(ka: string | number | undefined): boolean {
-  if (ka === 0) return true;
-  if (typeof ka === "string") {
-    const s = ka.trim();
-    return s === "0" || s === "0s" || s === "0ms" || s === "0m" || s === "0h";
-  }
-  return false;
 }
 
 async function resolveQuestionsForWire(
@@ -480,6 +528,9 @@ async function resolveQuestionsForWire(
       if (e?.status === 404) {
         throw ApiError.notFound(`preset '${presetName}' not found`);
       }
+      if (e instanceof HttpError && e.status !== undefined) {
+        throw httpErrorToApiError(e);
+      }
     }
     throw ApiError.notFound(`preset '${presetName}' not found`);
   }
@@ -491,45 +542,31 @@ async function resolveQuestionsForWire(
       return { questions: info.questions as Questions };
     }
   } catch (e: any) {
-    if (e?.status === 404) {
-      throw ApiError.notFound(`model '${model}' not found`);
+    if (e instanceof HttpError && e.status !== undefined) {
+      throw httpErrorToApiError(e, model);
     }
   }
   throw ApiError.validation([
     {
       type: "missing",
       loc: ["body", "questions"],
-      msg: `Field required (model '${model}' has no embedded questions and no preset was specified)`,
+      msg: "Field required",
     },
   ]);
 }
 
 export async function decideHttp(req: ValidatedDecideRequest | ValidatedV1Request, isV1: boolean): Promise<Record<string, unknown>> {
   const tStart = Date.now();
+  const tStartNs = process.hrtime.bigint();
 
-  // Lifecycle-only request on /api/decide (no state)
+  // Lifecycle-only request on /api/decide (no state): forward directly to Ollaya, never fabricate 200
   if (!isV1 && (req as ValidatedDecideRequest).state === undefined) {
     const dReq = req as ValidatedDecideRequest;
     try {
       const r = await ollaya.decide(dReq.model, undefined, undefined, { keepAlive: dReq.keep_alive });
       return r as unknown as Record<string, unknown>;
     } catch (e: any) {
-      if (e?.status === 404) throw ApiError.notFound(`model '${dReq.model}' not found`);
-      if (e?.status === 422 && e?.code === "MODEL_UNSUPPORTED") {
-        throw new ApiError(422, { error: e.message, code: "MODEL_UNSUPPORTED" });
-      }
-      return {
-        model: dReq.model,
-        answers: {},
-        usage: { input_tokens: 0, output_tokens: 0 },
-        routing: null,
-        state_truncated: false,
-        done_reason: isUnloadKeepAlive(dReq.keep_alive) ? "unload" : "load",
-        created_at: new Date().toISOString(),
-        total_duration: 0,
-        load_duration: 0,
-        eval_duration: 0,
-      };
+      throw httpErrorToApiError(e, dReq.model);
     }
   }
 
@@ -545,7 +582,9 @@ export async function decideHttp(req: ValidatedDecideRequest | ValidatedV1Reques
   let studentWire: ollaya.DecideResponse | undefined;
   let student: DecisionRow["student"] = null;
   let studentError: string | undefined;
+  let studentHttpError: any = undefined;
   const s0 = Date.now();
+  const s0Ns = process.hrtime.bigint();
   try {
     const dReq = req as ValidatedDecideRequest;
     studentWire = await ollaya.decide(req.model, state, questions, {
@@ -566,45 +605,23 @@ export async function decideHttp(req: ValidatedDecideRequest | ValidatedV1Reques
     };
   } catch (e: any) {
     studentError = e?.message ?? String(e);
+    studentHttpError = e;
   }
+  const studentMs = student?.latency_ms ?? (Date.now() - s0);
+  const studentDurationNs = Number(process.hrtime.bigint() - s0Ns);
 
-  // On /v1/* endpoints, state_truncated is a 422 STATE_TRUNCATED error
-  if (isV1 && studentWire?.state_truncated === true) {
-    const tInfo = ollama.syncTeacherInfo(config.ollamaModel);
-    void otlp.emitDecision({
-      id,
-      ref: req.addita?.ref ?? null,
-      preset: presetName,
-      model: studentWire.model || req.model,
-      teacher_model: tInfo.model,
-      teacher_host: tInfo.host,
-      source: "student",
-      teacher: "skipped",
-      guards: [],
-      agreement: {},
-      final: student?.simple ?? {},
-      noul: extractNoulScores(questions, studentWire.answers),
-      student_ms: student?.latency_ms ?? 0,
-      total_ms: Date.now() - tStart,
-      state_truncated: true,
-      status: "error",
-      error_code: "STATE_TRUNCATED",
-    });
-    throw ApiError.stateTruncated(studentWire.model || req.model);
-  }
-
-  // 2. Teacher (Ollama) with cloud -> local fallback policy
-  const allowCloud = req.addita?.allow_cloud_teacher ?? config.allowCloudTeacher;
+  // 2. Teacher (Ollama) with cloud -> local fallback policy (governed by ADDITA_NO_CLOUD)
+  const t0 = Date.now();
   const tOut = await runTeacherWithFallback(
     id,
     state,
     questions,
     student?.simple,
-    allowCloud,
     config.teacherMode === "off",
   );
   const teacher = tOut.teacher;
   const teacherState = tOut.wireState;
+  const teacherMs = teacherState === "skipped" ? 0 : (Date.now() - t0);
 
   // 3. Final simple decision: student -> teacher -> guards
   const merged: SimpleAnswers = { ...(student?.simple ?? {}), ...(teacher?.answers ?? {}) };
@@ -635,6 +652,9 @@ export async function decideHttp(req: ValidatedDecideRequest | ValidatedV1Reques
     teacher_status: teacherState,
     teacher_model: tOut.teacherModel,
     teacher_host: tOut.teacherHost,
+    ...(tOut.cloudPending ? { cloud_pending: true } : {}),
+    student_ms: studentMs,
+    teacher_ms: teacherMs,
     final: g.answers,
     final_source: source,
     guards: g.hits,
@@ -642,6 +662,20 @@ export async function decideHttp(req: ValidatedDecideRequest | ValidatedV1Reques
   store.addDecision(row);
   if (teacher) store.addTeacher(teacher);
   await lume.log(row, teacher);
+
+  // #5: Errors must not look like success on /v1/* (or 4xx/501 model/validation errors on /api/decide)
+  let postError: ApiError | undefined = undefined;
+  if (isV1 && studentWire?.state_truncated === true) {
+    postError = ApiError.stateTruncated(studentWire.model || req.model);
+  } else if (studentHttpError) {
+    const isClientOrModelErr =
+      studentHttpError instanceof HttpError &&
+      studentHttpError.status !== undefined &&
+      [400, 401, 403, 404, 409, 413, 422, 501].includes(studentHttpError.status);
+    if (isV1 || isClientOrModelErr) {
+      postError = httpErrorToApiError(studentHttpError, req.model);
+    }
+  }
 
   const totalMs = Date.now() - tStart;
   void otlp.emitDecision({
@@ -657,12 +691,17 @@ export async function decideHttp(req: ValidatedDecideRequest | ValidatedV1Reques
     agreement,
     final: g.answers,
     noul: extractNoulScores(questions, studentWire?.answers),
-    student_ms: student?.latency_ms ?? 0,
-    teacher_ms: teacher?.latency_ms,
+    student_ms: studentMs,
+    teacher_ms: teacherMs,
     total_ms: totalMs,
     state_truncated: !!studentWire?.state_truncated,
-    status: "ok",
+    status: postError ? "error" : "ok",
+    ...(postError ? { error_code: postError.body.code } : {}),
   });
+
+  if (postError) {
+    throw postError;
+  }
 
   const keepLaya = !isV1 && (req as ValidatedDecideRequest).extras.includes("laya");
   const wireAnswers = stripLayaExtra(studentWire?.answers ?? {}, keepLaya);
@@ -676,8 +715,13 @@ export async function decideHttp(req: ValidatedDecideRequest | ValidatedV1Reques
     };
   }
 
-  const totalDurationNs = studentWire?.total_duration ?? totalMs * 1_000_000;
-  const evalDurationNs = studentWire?.eval_duration ?? (student?.latency_ms ?? 0) * 1_000_000;
+  const evalDurationNs = studentWire?.eval_duration ?? studentWire?.total_duration ?? studentDurationNs;
+  const wallDurationNs = Number(process.hrtime.bigint() - tStartNs);
+  const totalDurationNs = Math.max(wallDurationNs, evalDurationNs);
+  const doneReason: "decide" | "load" | "unload" =
+    studentWire?.done_reason === "load" || studentWire?.done_reason === "unload"
+      ? studentWire.done_reason
+      : "decide";
 
   return {
     model: studentWire?.model ?? req.model,
@@ -685,7 +729,7 @@ export async function decideHttp(req: ValidatedDecideRequest | ValidatedV1Reques
     usage,
     routing: studentWire?.routing ?? null,
     state_truncated: studentWire?.state_truncated ?? false,
-    done_reason: studentWire?.done_reason ?? "complete",
+    done_reason: doneReason,
     created_at: studentWire?.created_at ?? ts,
     total_duration: totalDurationNs,
     load_duration: studentWire?.load_duration ?? 0,
@@ -698,9 +742,12 @@ export async function decideHttp(req: ValidatedDecideRequest | ValidatedV1Reques
       teacher: teacherState,
       teacher_model: tOut.teacherModel,
       teacher_host: tOut.teacherHost,
+      ...(tOut.cloudPending ? { cloud_pending: true } : {}),
       guards: g.hits,
       agreement,
       ...(teacher ? { teacher_answers: teacher.answers } : {}),
+      student_ms: studentMs,
+      teacher_ms: teacherMs,
     },
   };
 }
@@ -751,6 +798,7 @@ export function getDecision(id: string) {
 
   const updatedAt = row.label?.ts ?? row.teacher?.ts ?? row.ts;
   const fallbackTeacher = ollama.syncTeacherInfo(config.ollamaModel);
+  const cloudPending = row.teacher ? !!row.teacher.cloud_pending : !!row.cloud_pending;
 
   return {
     id: row.id,
@@ -762,20 +810,28 @@ export function getDecision(id: string) {
     teacher: teacherState,
     teacher_model: row.teacher?.model ?? row.teacher_model ?? fallbackTeacher.model,
     teacher_host: row.teacher?.host ?? row.teacher_host ?? fallbackTeacher.host,
+    ...(cloudPending ? { cloud_pending: true } : {}),
     guards: row.guards,
     agreement,
     ...(row.teacher ? { teacher_answers: row.teacher.answers } : {}),
+    student_ms: row.student_ms ?? row.student?.latency_ms ?? 0,
+    teacher_ms: row.teacher?.latency_ms ?? row.teacher_ms ?? 0,
     ...(row.label ? { labels: row.label.labels, labelled_by: row.label.by ?? null } : {}),
   };
 }
 
 // ---------------------------------------------------------------- backfill
 
-/** Ask the teacher about stored decisions it never saw (Ollama was offline at the time). */
-export async function backfill(limit = 25, opts: { allowCloudTeacher?: boolean } = {}) {
-  const pending = store.joined().filter((r) => !r.teacher);
-  const allowCloud = opts.allowCloudTeacher ?? config.allowCloudTeacher;
-  const { candidates } = await ollama.resolveTeacherCandidates(allowCloud);
+/**
+ * Ask the teacher about stored decisions it missed while offline, or rows marked
+ * `cloud_pending` where the local teacher answered because the cloud failed.
+ * When `ADDITA_NO_CLOUD=true`, never sends anything to a cloud teacher.
+ */
+export async function backfill(limit = 25) {
+  const pending = store.joined().filter(
+    (r) => !r.teacher || (!config.noCloud && r.teacher.cloud_pending === true),
+  );
+  const { candidates } = await ollama.resolveTeacherCandidates();
   if (candidates.length === 0) {
     return { status: "skipped", labelled: 0, remaining: pending.length, errors: [] as string[] };
   }
@@ -783,7 +839,15 @@ export async function backfill(limit = 25, opts: { allowCloudTeacher?: boolean }
   let labelled = 0;
   const errors: string[] = [];
   for (const r of pending.slice(0, limit)) {
-    const tOut = await runTeacherWithFallback(r.id, r.state, r.questions, r.student?.simple, allowCloud, false);
+    const isCloudUpgrade = !!r.teacher && r.teacher.cloud_pending === true;
+    const tOut = await runTeacherWithFallback(
+      r.id,
+      r.state,
+      r.questions,
+      r.student?.simple,
+      false,
+      isCloudUpgrade,
+    );
     if (tOut.teacher) {
       const row: TeacherRow = { ...tOut.teacher, backfill: true };
       store.addTeacher(row);

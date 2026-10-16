@@ -3,10 +3,11 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, w
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { config } from "./config.js";
 import { decideHttp, getDecision, label, listPresets, tryLoadLocalPreset } from "./addita.js";
+import { requestJson } from "./http.js";
+import * as lume from "./lume.js";
+import * as ollama from "./ollama.js";
 import * as ollaya from "./ollaya.js";
 import {
   ApiError,
@@ -24,6 +25,41 @@ import {
 } from "./validate.js";
 
 const REQ_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+
+const readiness = {
+  ready: false,
+  ollaya: false,
+  ollama: false,
+};
+
+export async function probeBackendsInBackground(): Promise<void> {
+  const [ollayaProbe, ollamaProbe, lumeVer] = await Promise.allSettled([
+    requestJson<{ version?: string }>(ollaya.url("/api/version"), {
+      headers: ollaya.headers(),
+      timeoutMs: 5000,
+    }),
+    ollama.isOnline(true),
+    lume.version(),
+  ]);
+  const ollayaOk = ollayaProbe.status === "fulfilled";
+  ollaya.setKnownOnline(ollayaOk);
+  readiness.ollaya = ollayaOk;
+  readiness.ollama = ollamaProbe.status === "fulfilled" ? ollamaProbe.value : false;
+  readiness.ready = true;
+  if (lumeVer.status === "fulfilled" && lumeVer.value) {
+    lume.scheduleReindex();
+  }
+}
+
+let mcpModulePromise: Promise<typeof import("./mcp.js")> | undefined;
+let mcpHttpHandler:
+  | ((req: IncomingMessage, res: ServerResponse, reqId: string) => Promise<void>)
+  | undefined;
+
+export function preloadMcpModule(): Promise<typeof import("./mcp.js")> {
+  mcpModulePromise ??= import("./mcp.js");
+  return mcpModulePromise;
+}
 
 function resolveRequestId(req: IncomingMessage): string {
   const raw = req.headers["x-request-id"];
@@ -152,6 +188,13 @@ async function forwardToOllaya(
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: ctrl.signal,
     });
+    readiness.ollaya = true;
+    readiness.ready = true;
+    const upstreamHeaders: Record<string, string | undefined> = {
+      allow: upstream.headers.get("allow") ?? undefined,
+      "retry-after": upstream.headers.get("retry-after") ?? undefined,
+      "www-authenticate": upstream.headers.get("www-authenticate") ?? undefined,
+    };
     const ct = upstream.headers.get("content-type") ?? "application/json";
     if (ct.includes("application/x-ndjson") && upstream.body) {
       setCommonHeaders(res, reqId, isV1, { "content-type": ct });
@@ -164,14 +207,22 @@ async function forwardToOllaya(
       return;
     }
     const raw = await upstream.text();
+    if (!upstream.ok) {
+      throw ApiError.fromResponse(upstream.status, raw, upstreamHeaders);
+    }
     let parsed: unknown;
     try {
       parsed = raw ? JSON.parse(raw) : {};
     } catch {
-      parsed = { error: raw || `upstream status ${upstream.status}`, code: "INTERNAL_ERROR" };
+      parsed = { error: raw || `upstream status ${upstream.status}`, code: "INTERNAL" };
     }
-    sendJson(res, upstream.status, parsed, reqId, isV1);
+    const forwardedHeaders: Record<string, string> = {};
+    if (upstreamHeaders.allow) forwardedHeaders.allow = upstreamHeaders.allow;
+    if (upstreamHeaders["retry-after"]) forwardedHeaders["retry-after"] = upstreamHeaders["retry-after"];
+    sendJson(res, upstream.status, parsed, reqId, isV1, forwardedHeaders);
   } catch (e: any) {
+    if (e instanceof ApiError) throw e;
+    readiness.ollaya = false;
     throw ApiError.backendUnavailable(`cannot reach Ollaya at ${config.ollayaUrl}: ${e?.cause?.code ?? e?.message ?? e}`);
   } finally {
     clearTimeout(timer);
@@ -201,79 +252,10 @@ export function writeServeJson(port: number) {
 }
 
 export function startHttpServer(
-  createMcpServer: () => McpServer,
   opts: { host?: string; port?: number } = {},
 ): Promise<{ server: Server; port: number }> {
   const host = opts.host ?? config.host;
   const port = opts.port ?? config.port;
-
-  // Active stateful MCP sessions keyed by session ID
-  const mcpSessions = new Map<string, StreamableHTTPServerTransport>();
-
-  async function handleMcpRequest(req: IncomingMessage, res: ServerResponse, reqId: string) {
-    setCommonHeaders(res, reqId, false);
-    const method = req.method ?? "GET";
-    if (method !== "POST" && method !== "GET" && method !== "DELETE") {
-      throw ApiError.methodNotAllowed(method, "/mcp", "GET, POST, DELETE");
-    }
-
-    const rawSid = req.headers["mcp-session-id"];
-    const sid = Array.isArray(rawSid) ? rawSid[0] : rawSid;
-
-    if (sid && mcpSessions.has(sid)) {
-      const transport = mcpSessions.get(sid)!;
-      if (method === "POST") {
-        const raw = await readRawBody(req);
-        const parsed = parseJsonObject(raw);
-        await transport.handleRequest(req, res, parsed);
-      } else {
-        await transport.handleRequest(req, res);
-      }
-      return;
-    }
-
-    if (method === "POST") {
-      const raw = await readRawBody(req);
-      const parsed = parseJsonObject(raw);
-      const isInit =
-        parsed.method === "initialize" ||
-        (Array.isArray(parsed) && parsed.some((m: any) => m?.method === "initialize"));
-
-      if (isInit) {
-        const mcp = createMcpServer();
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          enableJsonResponse: true,
-          onsessioninitialized: (newSid) => {
-            mcpSessions.set(newSid, transport);
-          },
-          onsessionclosed: (closedSid) => {
-            mcpSessions.delete(closedSid);
-          },
-        });
-        transport.onclose = () => {
-          if (transport.sessionId) mcpSessions.delete(transport.sessionId);
-        };
-        await mcp.connect(transport);
-        await transport.handleRequest(req, res, parsed);
-        return;
-      }
-
-      // Stateless one-shot request if no session ID was negotiated
-      if (!sid) {
-        const mcp = createMcpServer();
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: undefined,
-          enableJsonResponse: true,
-        });
-        await mcp.connect(transport);
-        await transport.handleRequest(req, res, parsed);
-        return;
-      }
-    }
-
-    throw ApiError.notFound("MCP session not found");
-  }
 
   const server = createServer(async (req, res) => {
     const reqId = resolveRequestId(req);
@@ -296,9 +278,13 @@ export function startHttpServer(
         return;
       }
 
-      // /mcp Streamable HTTP MCP transport
+      // /mcp Streamable HTTP MCP transport (lazily loaded so HTTP startup is instant)
       if (pathname === "/mcp") {
-        await handleMcpRequest(req, res, reqId);
+        if (!mcpHttpHandler) {
+          const mod = await preloadMcpModule();
+          mcpHttpHandler = mod.createMcpHttpHandler({ setCommonHeaders, readRawBody });
+        }
+        await mcpHttpHandler(req, res, reqId);
         return;
       }
 
@@ -316,7 +302,15 @@ export function startHttpServer(
         if (method !== "GET" && method !== "HEAD") {
           throw ApiError.methodNotAllowed(method, pathname, "GET, HEAD");
         }
-        const body = { service: "addita", version: "0.1.0" };
+        const latestOllaya = ollaya.isKnownOnline() ?? readiness.ollaya;
+        const latestOllama = ollama.lastProbe()?.online ?? readiness.ollama;
+        const body = {
+          service: "addita",
+          version: "0.1.0",
+          ready: readiness.ready || latestOllaya || latestOllama,
+          ollaya: latestOllaya,
+          ollama: latestOllama,
+        };
         if (method === "HEAD") {
           const payload = Buffer.from(JSON.stringify(body), "utf8");
           setCommonHeaders(res, reqId, false, {
@@ -349,6 +343,7 @@ export function startHttpServer(
         const body = parseJsonObject(raw);
         const validated = validateDecideRequest(body);
         const out = await decideHttp(validated, false);
+        readiness.ready = true;
         sendJson(res, 200, out, reqId, false);
         return;
       }
@@ -362,6 +357,8 @@ export function startHttpServer(
         const body = parseJsonObject(raw);
         const validated = validateV1Request(body);
         const out = await decideHttp(validated, true);
+        readiness.ollaya = true;
+        readiness.ready = true;
         sendJson(res, 200, out, reqId, true);
         return;
       }
@@ -619,7 +616,7 @@ export function startHttpServer(
       sendJson(
         res,
         500,
-        { error: e?.message ?? "internal server error", code: "INTERNAL_ERROR" },
+        { error: e?.message ?? "internal server error", code: "INTERNAL" },
         reqId,
         isV1,
       );
@@ -636,6 +633,7 @@ export function startHttpServer(
       } catch (e: any) {
         console.error(`addita: could not write serve.json: ${e?.message ?? e}`);
       }
+      void probeBackendsInBackground();
       resolve({ server, port: actualPort });
     });
   });

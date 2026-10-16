@@ -19,9 +19,9 @@ import type { DecisionRow, LabelRow, TeacherRow } from "./store.js";
 
 const L = config.lume;
 
-function run(args: string[]): Promise<{ stdout: string; stderr: string }> {
+function run(args: string[], timeoutMs = L.timeoutMs): Promise<{ stdout: string; stderr: string }> {
   return new Promise((ok, fail) => {
-    execFile(L.bin, args, { timeout: L.timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile(L.bin, args, { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) fail(new Error(`${L.bin} ${args[0]} failed: ${(stderr || err.message).toString().trim().slice(-400)}`));
       else ok({ stdout: stdout.toString(), stderr: stderr.toString() });
     });
@@ -35,7 +35,7 @@ let available: Promise<string | null> | undefined;
 /** Lume version string, or null when it is off or not installed. */
 export function version(): Promise<string | null> {
   if (L.mode === "off") return Promise.resolve(null);
-  available ??= run(["--version"]).then(
+  available ??= run(["--version"], 2000).then(
     (r) => r.stdout.trim().split("\n")[0] || "lume",
     () => null,
   );

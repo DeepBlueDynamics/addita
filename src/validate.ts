@@ -15,17 +15,26 @@ export const MAX_PRESET_NAME_BYTES = 128;
 
 export type ErrorCode =
   | "INVALID_JSON"
-  | "REQUEST_TOO_LARGE"
+  | "INVALID_REQUEST"
+  | "TOO_MANY_OPTIONS"
+  | "INPUT_TOO_LONG"
+  | "STATE_TRUNCATED"
   | "UNAUTHORIZED"
+  | "FORBIDDEN"
+  | "MODEL_NOT_FOUND"
   | "NOT_FOUND"
   | "METHOD_NOT_ALLOWED"
-  | "UNPROCESSABLE_REQUEST"
-  | "STATE_TRUNCATED"
-  | "MODEL_UNSUPPORTED"
-  | "BUSY"
-  | "INTERNAL_ERROR"
+  | "OPERATION_IN_PROGRESS"
+  | "REQUEST_TOO_LARGE"
+  | "QUEUE_FULL"
+  | "MODEL_LOAD_FAILED"
+  | "INFERENCE_FAILED"
+  | "STORAGE_ERROR"
+  | "INTERNAL"
+  | "UNSUPPORTED_MODEL"
   | "NOT_IMPLEMENTED"
-  | "BACKEND_UNAVAILABLE";
+  | "REGISTRY_ERROR"
+  | "DIGEST_MISMATCH";
 
 export type LocPart = string | number;
 
@@ -40,6 +49,46 @@ export interface ErrorBody {
   error: string;
   code: ErrorCode;
   detail?: ValidationIssue[];
+}
+
+export function issuesMessage(issues: ValidationIssue[]): string {
+  if (issues.length === 0) return "request validation failed";
+  return issues
+    .map((i) => {
+      const pathParts = i.loc[0] === "body" ? i.loc.slice(1) : i.loc;
+      const path = pathParts.map(String).join(".");
+      return path === "" ? i.msg : `${path}: ${i.msg}`;
+    })
+    .join("; ");
+}
+
+export function defaultCodeForStatus(status: number): ErrorCode {
+  switch (status) {
+    case 400:
+      return "INVALID_JSON";
+    case 401:
+      return "UNAUTHORIZED";
+    case 403:
+      return "FORBIDDEN";
+    case 404:
+      return "NOT_FOUND";
+    case 405:
+      return "METHOD_NOT_ALLOWED";
+    case 409:
+      return "OPERATION_IN_PROGRESS";
+    case 413:
+      return "REQUEST_TOO_LARGE";
+    case 422:
+      return "INVALID_REQUEST";
+    case 501:
+      return "NOT_IMPLEMENTED";
+    case 502:
+      return "REGISTRY_ERROR";
+    case 503:
+      return "QUEUE_FULL";
+    default:
+      return "INTERNAL";
+  }
 }
 
 export class ApiError extends Error {
@@ -57,21 +106,25 @@ export class ApiError extends Error {
 
   static requestTooLarge(limit = MAX_BODY_BYTES): ApiError {
     return new ApiError(413, {
-      error: `request body is larger than ${limit} bytes`,
+      error: `request body exceeds the ${limit}-byte limit`,
       code: "REQUEST_TOO_LARGE",
     });
   }
 
-  static unauthorized(msg = "missing or invalid Authorization: Bearer token"): ApiError {
+  static unauthorized(msg = "unauthorized"): ApiError {
     return new ApiError(
       401,
       { error: msg, code: "UNAUTHORIZED" },
-      { "www-authenticate": "Bearer" },
+      { "www-authenticate": 'Bearer realm="ollaya"' },
     );
   }
 
   static notFound(msg: string): ApiError {
     return new ApiError(404, { error: msg, code: "NOT_FOUND" });
+  }
+
+  static modelNotFound(name: string): ApiError {
+    return new ApiError(404, { error: `model '${name}' not found`, code: "MODEL_NOT_FOUND" });
   }
 
   static methodNotAllowed(method: string, path: string, allowed: string): ApiError {
@@ -86,23 +139,26 @@ export class ApiError extends Error {
   }
 
   static validation(issues: ValidationIssue[]): ApiError {
-    const first = issues[0];
-    const summary = first
-      ? first.loc.length === 0
-        ? first.msg
-        : `${first.loc.map(String).join(".")}: ${first.msg}`
-      : "request validation failed";
     return new ApiError(422, {
-      error: summary,
-      code: "UNPROCESSABLE_REQUEST",
+      error: issuesMessage(issues),
+      code: "INVALID_REQUEST",
       detail: issues,
     });
   }
 
   static stateTruncated(model: string): ApiError {
+    const detail: ValidationIssue[] = [
+      {
+        type: "state_truncated",
+        loc: ["body", "state"],
+        msg: `part of state was dropped to fit the context of ${model}`,
+        ctx: { model },
+      },
+    ];
     return new ApiError(422, {
-      error: `state exceeded ${model}'s context window and was truncated; shorten state or call /api/decide which reports state_truncated without failing`,
+      error: issuesMessage(detail),
       code: "STATE_TRUNCATED",
+      detail,
     });
   }
 
@@ -111,11 +167,51 @@ export class ApiError extends Error {
   }
 
   static backendUnavailable(msg: string): ApiError {
-    return new ApiError(503, { error: msg, code: "BACKEND_UNAVAILABLE" });
+    return new ApiError(503, { error: msg, code: "INTERNAL" });
   }
 
   static internal(msg: string): ApiError {
-    return new ApiError(500, { error: msg, code: "INTERNAL_ERROR" });
+    return new ApiError(500, { error: msg, code: "INTERNAL" });
+  }
+
+  static fromResponse(
+    status: number,
+    raw: string,
+    upstreamHeaders?: Record<string, string | undefined>,
+  ): ApiError {
+    const headers: Record<string, string> = {};
+    if (upstreamHeaders) {
+      for (const k of ["allow", "retry-after", "www-authenticate"]) {
+        const v = upstreamHeaders[k];
+        if (v) headers[k] = v;
+      }
+    }
+    const trimmed = raw.trim();
+    if (trimmed) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const error = typeof parsed.error === "string" ? parsed.error : trimmed;
+          const code = (typeof parsed.code === "string" ? parsed.code : defaultCodeForStatus(status)) as ErrorCode;
+          const detail = Array.isArray(parsed.detail) ? (parsed.detail as ValidationIssue[]) : undefined;
+          return new ApiError(
+            status,
+            { error, code, ...(detail ? { detail } : {}) },
+            Object.keys(headers).length ? headers : undefined,
+          );
+        }
+      } catch {
+        /* fall through */
+      }
+    }
+    return new ApiError(
+      status,
+      {
+        error: trimmed || `HTTP ${status}`,
+        code: defaultCodeForStatus(status),
+      },
+      Object.keys(headers).length ? headers : undefined,
+    );
   }
 }
 
@@ -132,19 +228,10 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-function jsonTypeName(v: unknown): string {
-  if (v === null || v === undefined) return "null";
-  if (typeof v === "boolean") return "boolean";
-  if (typeof v === "number") return "number";
-  if (typeof v === "string") return "string";
-  if (Array.isArray(v)) return "array";
-  return "object";
-}
-
 export function parseJsonObject(raw: Buffer | string): Record<string, unknown> {
   const text = typeof raw === "string" ? raw : raw.toString("utf8");
   if (!text.trim()) {
-    throw ApiError.invalidJson("missing request body");
+    throw ApiError.invalidJson("request body is empty (expected a JSON object)");
   }
   let parsed: unknown;
   try {
@@ -164,10 +251,10 @@ const MAX_KEEP_ALIVE_SECS = 365 * 24 * 3600;
 
 export function parseDurationString(raw: string): number {
   const s = raw.trim();
-  if (!s) throw new Error("keep_alive duration string must not be empty");
+  if (!s) throw new Error("keep_alive string cannot be empty");
   if (s.startsWith("-")) return -1;
   let rest = s.startsWith("+") ? s.slice(1) : s;
-  if (!rest) throw new Error(`invalid duration '${raw}'`);
+  if (!rest) throw new Error(`invalid keep_alive duration '${raw}'`);
   if (rest === "0") return 0;
 
   let totalSecs = 0;
@@ -196,6 +283,7 @@ export function parseDurationString(raw: string): number {
       unitEnd++;
     }
     const unit = rest.slice(0, unitEnd);
+    if (!unit) return value;
     rest = rest.slice(unitEnd);
     let factor: number;
     switch (unit) {
@@ -220,13 +308,13 @@ export function parseDurationString(raw: string): number {
         factor = 3600;
         break;
       default:
-        throw new Error(`unknown or missing unit '${unit}' in duration '${raw}' (supported: ns, us, ms, s, m, h)`);
+        throw new Error(`unknown duration unit '${unit}' in keep_alive '${raw}' (expected ns, us, ms, s, m, h)`);
     }
     totalSecs += value * factor;
     consumedAny = true;
   }
   if (!consumedAny || !Number.isFinite(totalSecs) || totalSecs < 0) {
-    throw new Error(`invalid duration '${raw}'`);
+    throw new Error(`invalid keep_alive duration '${raw}'`);
   }
   return Math.min(totalSecs, MAX_KEEP_ALIVE_SECS);
 }
@@ -235,7 +323,7 @@ function validateKeepAlive(v: unknown, loc: LocPart[], issues: ValidationIssue[]
   if (v === undefined || v === null) return undefined;
   if (typeof v === "number") {
     if (!Number.isFinite(v)) {
-      issues.push(issue("value_error", loc, "keep_alive must be a finite number"));
+      issues.push(issue("keep_alive", loc, "keep_alive must be a finite number"));
       return undefined;
     }
     return v;
@@ -245,11 +333,11 @@ function validateKeepAlive(v: unknown, loc: LocPart[], issues: ValidationIssue[]
       parseDurationString(v);
       return v;
     } catch (e: any) {
-      issues.push(issue("value_error", loc, e?.message ?? String(e)));
+      issues.push(issue("keep_alive", loc, e?.message ?? String(e)));
       return undefined;
     }
   }
-  issues.push(issue("value_error", loc, "keep_alive must be a duration string (e.g. '5m') or a number of seconds"));
+  issues.push(issue("keep_alive", loc, "keep_alive must be a duration string (e.g. '5m') or a number of seconds"));
   return undefined;
 }
 
@@ -304,7 +392,7 @@ function requireModelField(body: Record<string, unknown>, field: string, issues:
   }
   const err = validateModelName(v);
   if (err) {
-    issues.push(issue("value_error", loc, err));
+    issues.push(issue("model_name", loc, err));
     return "";
   }
   return v;
@@ -332,7 +420,7 @@ export function validatePresetName(raw: unknown, loc: LocPart[], issues: Validat
       issue(
         "value_error",
         loc,
-        `invalid preset name '${raw}'; use ASCII letters, digits, '.', '_' or '-'`,
+        "a preset name is 1 to 64 characters of a-z, 0-9, '-' and '_', starting with a letter or digit",
       ),
     );
     return "";
@@ -357,12 +445,12 @@ function validateStreamField(
 function validateCriteriaValue(v: unknown, loc: LocPart[], allowNull: boolean, issues: ValidationIssue[]) {
   if (v === null) {
     if (!allowNull) {
-      issues.push(issue("json_type", loc, "Input should be a string, object, or array"));
+      issues.push(issue("criteria_type", loc, "Input should be a string, an object or an array"));
     }
     return;
   }
   if (typeof v === "string" || Array.isArray(v) || isPlainObject(v)) return;
-  issues.push(issue("json_type", loc, "Input should be a string, object, or array"));
+  issues.push(issue("criteria_type", loc, "Input should be a string, an object or an array"));
 }
 
 function validateInstructions(qObj: Record<string, unknown>, baseLoc: LocPart[], issues: ValidationIssue[]) {
@@ -374,7 +462,7 @@ function validateInstructions(qObj: Record<string, unknown>, baseLoc: LocPart[],
 function validateQuestion(id: string, raw: unknown, issues: ValidationIssue[]): Question | undefined {
   const qLoc: LocPart[] = ["body", "questions", id];
   if (!isPlainObject(raw)) {
-    issues.push(issue("model_type", qLoc, "Input should be a valid dictionary or object"));
+    issues.push(issue("dict_type", qLoc, "Input should be a valid dictionary"));
     return undefined;
   }
   const typeVal = raw.type;
@@ -402,22 +490,33 @@ function validateQuestion(id: string, raw: unknown, issues: ValidationIssue[]): 
       if (isPlainObject(c)) {
         const keys = Object.keys(c);
         if (keys.length < 2) {
-          issues.push(issue("value_error", cLoc, "Value error, choice criteria must define at least 2 options"));
+          issues.push(
+            issue("too_short", cLoc, `Dictionary should have at least 2 items after validation, not ${keys.length}`, {
+              field_type: "Dictionary",
+              min_length: 2,
+              actual_length: keys.length,
+            }),
+          );
           return undefined;
         }
         if (keys.length > MAX_CHOICE_LABELS) {
           issues.push(
             issue(
-              "value_error",
+              "too_long",
               cLoc,
-              `Value error, choice criteria supports at most ${MAX_CHOICE_LABELS} options (got ${keys.length})`,
+              `Dictionary should have at most ${MAX_CHOICE_LABELS} items after validation, not ${keys.length}`,
+              {
+                field_type: "Dictionary",
+                max_length: MAX_CHOICE_LABELS,
+                actual_length: keys.length,
+              },
             ),
           );
           return undefined;
         }
         for (const [label, desc] of Object.entries(c)) {
           if (!label.trim()) {
-            issues.push(issue("value_error", [...cLoc, label], "Value error, choice option label must not be empty"));
+            issues.push(issue("string_too_short", [...cLoc, label], "String should have at least 1 character", { min_length: 1 }));
           }
           validateCriteriaValue(desc, [...cLoc, label], true, issues);
         }
@@ -431,9 +530,14 @@ function validateQuestion(id: string, raw: unknown, issues: ValidationIssue[]): 
         if (c.length > MAX_CHOICE_LABELS) {
           issues.push(
             issue(
-              "value_error",
+              "too_long",
               cLoc,
-              `Value error, choice criteria supports at most ${MAX_CHOICE_LABELS} options (got ${c.length})`,
+              `List should have at most ${MAX_CHOICE_LABELS} items after validation, not ${c.length}`,
+              {
+                field_type: "List",
+                max_length: MAX_CHOICE_LABELS,
+                actual_length: c.length,
+              },
             ),
           );
           return undefined;
@@ -445,13 +549,19 @@ function validateQuestion(id: string, raw: unknown, issues: ValidationIssue[]): 
           if (typeof item !== "string") {
             issues.push(issue("string_type", iLoc, "Input should be a valid string"));
           } else if (!item.trim()) {
-            issues.push(issue("value_error", iLoc, "Value error, choice option label must not be empty"));
+            issues.push(issue("string_too_short", iLoc, "String should have at least 1 character", { min_length: 1 }));
           } else {
             seen.add(item);
           }
         }
         if (seen.size < 2) {
-          issues.push(issue("value_error", cLoc, "Value error, choice criteria must define at least 2 options"));
+          issues.push(
+            issue("too_short", cLoc, `List should have at least 2 items after validation, not ${c.length}`, {
+              field_type: "List",
+              min_length: 2,
+              actual_length: c.length,
+            }),
+          );
           return undefined;
         }
         return {
@@ -461,7 +571,7 @@ function validateQuestion(id: string, raw: unknown, issues: ValidationIssue[]): 
         };
       }
       issues.push(
-        issue("dict_type", cLoc, "Input should be a valid dictionary or an array of option strings"),
+        issue("dict_type", cLoc, "Input should be a valid dictionary"),
       );
       return undefined;
     }
@@ -518,7 +628,7 @@ function validateQuestion(id: string, raw: unknown, issues: ValidationIssue[]): 
         };
       }
       if (!isPlainObject(c)) {
-        issues.push(issue("model_type", cLoc, "Input should be a valid dictionary or object"));
+        issues.push(issue("dict_type", cLoc, "Input should be a valid dictionary"));
         return undefined;
       }
       if ("true" in c && c.true !== undefined) {
@@ -561,15 +671,26 @@ export function validateQuestionsMap(v: unknown, issues: ValidationIssue[]): Que
   }
   const entries = Object.entries(v);
   if (entries.length === 0) {
-    issues.push(issue("value_error", loc, "Value error, questions must contain at least 1 question"));
+    issues.push(
+      issue("too_short", loc, "Dictionary should have at least 1 item after validation, not 0", {
+        field_type: "Dictionary",
+        min_length: 1,
+        actual_length: 0,
+      }),
+    );
     return undefined;
   }
   if (entries.length > MAX_QUESTIONS) {
     issues.push(
       issue(
-        "value_error",
+        "too_long",
         loc,
-        `Value error, questions supports at most ${MAX_QUESTIONS} questions per request (got ${entries.length})`,
+        `Dictionary should have at most ${MAX_QUESTIONS} items after validation, not ${entries.length}`,
+        {
+          field_type: "Dictionary",
+          max_length: MAX_QUESTIONS,
+          actual_length: entries.length,
+        },
       ),
     );
     return undefined;
@@ -577,7 +698,7 @@ export function validateQuestionsMap(v: unknown, issues: ValidationIssue[]): Que
   const out: Questions = {};
   for (const [id, qVal] of entries) {
     if (!id.trim()) {
-      issues.push(issue("value_error", ["body", "questions", id], "Value error, question id must not be empty"));
+      issues.push(issue("string_too_short", ["body", "questions", id], "String should have at least 1 character", { min_length: 1 }));
       continue;
     }
     const q = validateQuestion(id, qVal, issues);
@@ -590,7 +711,6 @@ export function validateQuestionsMap(v: unknown, issues: ValidationIssue[]): Que
 
 export interface AdditaRequestOptions {
   ref?: string;
-  allow_cloud_teacher?: boolean;
 }
 
 export interface ValidatedDecideRequest {
@@ -607,7 +727,7 @@ export interface ValidatedDecideRequest {
 export interface ValidatedV1Request {
   model: string;
   state: unknown;
-  questions: Questions;
+  questions?: Questions;
   addita?: AdditaRequestOptions;
 }
 
@@ -626,13 +746,7 @@ function validateAdditaBlock(v: unknown, issues: ValidationIssue[]): AdditaReque
       out.ref = v.ref;
     }
   }
-  if (v.allow_cloud_teacher !== undefined && v.allow_cloud_teacher !== null) {
-    if (typeof v.allow_cloud_teacher !== "boolean") {
-      issues.push(issue("bool_type", [...loc, "allow_cloud_teacher"], "Input should be a valid boolean"));
-    } else {
-      out.allow_cloud_teacher = v.allow_cloud_teacher;
-    }
-  }
+  // Unknown fields inside `addita` (such as legacy `allow_cloud_teacher`) are ignored harmlessly.
   return out;
 }
 
@@ -648,9 +762,9 @@ export function validateDecideRequest(body: Record<string, unknown>): ValidatedD
     } else {
       issues.push(
         issue(
-          "state_invalid_type",
+          "state_type",
           ["body", "state"],
-          `state must be a string, object, or array (got ${jsonTypeName(s)})`,
+          "Input should be a string, an object or an array",
         ),
       );
     }
@@ -667,9 +781,9 @@ export function validateDecideRequest(body: Record<string, unknown>): ValidatedD
     if (p) preset = p;
   }
 
-  if (questions !== undefined && preset !== undefined) {
+  if (body.questions !== undefined && body.questions !== null && body.preset !== undefined && body.preset !== null) {
     issues.push(
-      issue("value_error", ["body", "preset"], "preset and questions are mutually exclusive; pass one or the other"),
+      issue("value_error", ["body", "preset"], "give either 'questions' or 'preset', not both"),
     );
   }
 
@@ -686,7 +800,7 @@ export function validateDecideRequest(body: Record<string, unknown>): ValidatedD
         if (typeof item !== "string") {
           issues.push(issue("string_type", iLoc, "Input should be a valid string"));
         } else if (!item.trim()) {
-          issues.push(issue("string_too_short", iLoc, "image entry must not be empty"));
+          issues.push(issue("string_too_short", iLoc, "String should have at least 1 character", { min_length: 1 }));
         } else {
           list.push(item);
         }
@@ -724,7 +838,7 @@ export function validateDecideRequest(body: Record<string, unknown>): ValidatedD
         issue(
           "stream_unsupported",
           loc,
-          "/api/decide is a single-forward-pass endpoint and does not support streaming; omit 'stream' or set it to false",
+          '/api/decide does not stream; omit "stream" or set it to false',
         ),
       );
     } else if (body.stream !== false) {
@@ -733,7 +847,7 @@ export function validateDecideRequest(body: Record<string, unknown>): ValidatedD
   }
 
   if (state === undefined && (questions !== undefined || preset !== undefined || images !== undefined)) {
-    issues.push(issue("missing", ["body", "state"], "Field required when questions, preset, or images are provided"));
+    issues.push(issue("missing", ["body", "state"], "Field required"));
   }
 
   const addita = validateAdditaBlock(body.addita, issues);
@@ -755,33 +869,16 @@ export function validateV1Request(body: Record<string, unknown>): ValidatedV1Req
   } else {
     issues.push(
       issue(
-        "state_invalid_type",
+        "state_type",
         ["body", "state"],
-        `state must be a string, object, or array (got ${jsonTypeName(body.state)})`,
+        "Input should be a string, an object or an array",
       ),
     );
   }
 
-  let questions: Questions = {};
-  if (body.questions === undefined || body.questions === null) {
-    issues.push(issue("missing", ["body", "questions"], "Field required"));
-  } else {
-    questions = validateQuestionsMap(body.questions, issues) ?? {};
-  }
-
-  if (body.stream !== undefined && body.stream !== null) {
-    const loc: LocPart[] = ["body", "stream"];
-    if (body.stream === true) {
-      issues.push(
-        issue(
-          "stream_unsupported",
-          loc,
-          "this endpoint runs a single forward pass and does not support streaming; omit 'stream' or set it to false",
-        ),
-      );
-    } else if (body.stream !== false) {
-      issues.push(issue("bool_type", loc, "Input should be a valid boolean"));
-    }
+  let questions: Questions | undefined = undefined;
+  if (body.questions !== undefined && body.questions !== null) {
+    questions = validateQuestionsMap(body.questions, issues);
   }
 
   const addita = validateAdditaBlock(body.addita, issues);
@@ -806,7 +903,7 @@ export function validateShowRequest(body: Record<string, unknown>): { model: str
     issues.push(issue("string_too_short", ["body", field], "String should have at least 1 character", { min_length: 1 }));
   } else {
     const err = validateModelName(rawName);
-    if (err) issues.push(issue("value_error", ["body", field], err));
+    if (err) issues.push(issue("model_name", ["body", field], err));
     else model = rawName;
   }
 
@@ -865,7 +962,7 @@ function validateCalibration(v: unknown, issues: ValidationIssue[]): Calibration
       for (const [k, raw] of Object.entries(v.temperature_by_options)) {
         const kLoc: LocPart[] = [...tLoc, k];
         if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0 || raw > 100) {
-          issues.push(issue("value_error", kLoc, "temperature must be a finite number in (0, 100]"));
+          issues.push(issue("calibration_temperature", kLoc, "temperature must be a finite number in [0.01, 100.0]"));
         } else {
           byOptions[k] = raw;
         }
@@ -876,7 +973,7 @@ function validateCalibration(v: unknown, issues: ValidationIssue[]): Calibration
   if (v.noul_threshold !== undefined && v.noul_threshold !== null) {
     const nLoc: LocPart[] = [...loc, "noul_threshold"];
     if (typeof v.noul_threshold !== "number" || !Number.isFinite(v.noul_threshold) || v.noul_threshold <= 0 || v.noul_threshold >= 1) {
-      issues.push(issue("value_error", nLoc, "noul_threshold must be a finite number in (0, 1)"));
+      issues.push(issue("calibration_noul_threshold", nLoc, "noul_threshold must be a finite number in (0.0, 1.0)"));
     } else {
       noulThreshold = v.noul_threshold;
     }

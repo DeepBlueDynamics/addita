@@ -3,7 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -78,6 +78,16 @@ async function httpJson(path, init = {}) {
   return { status: res.status, headers: res.headers, data };
 }
 
+function readDecisionsJsonl() {
+  const p = join(dataDir, "decisions.jsonl");
+  if (!existsSync(p)) return [];
+  return readFileSync(p, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
 const ok = (msg) => console.log(`  ✓ ${msg}`);
 const hasLume = spawnSync("lume", ["--version"]).status === 0;
 
@@ -103,7 +113,7 @@ try {
   assert.equal(st.ollama.online, true);
   assert.equal(st.ollama.teacher_model, "deepseek-v4.1-flash:cloud");
   assert.equal(st.ollama.local_teacher_model, "qwen3.5:4b");
-  assert.equal(st.allow_cloud_teacher, true);
+  assert.equal(st.no_cloud, false);
   assert.ok(st.presets.includes("comms") && st.presets.includes("lume.sql_judge"));
   ok("both backends online, default teachers deepseek-v4.1-flash:cloud + qwen3.5:4b, presets discovered");
 
@@ -252,15 +262,19 @@ try {
 
   const healthRes = await httpJson("/health");
   assert.equal(healthRes.status, 200);
-  assert.deepEqual(healthRes.data, { service: "addita", version: "0.1.0" });
+  assert.equal(healthRes.data.service, "addita");
+  assert.equal(healthRes.data.version, "0.1.0");
+  assert.equal(healthRes.data.ready, true);
+  assert.equal(healthRes.data.ollaya, true);
+  assert.equal(healthRes.data.ollama, true);
 
   const verRes = await httpJson("/api/version");
   assert.equal(verRes.status, 200);
   assert.equal(verRes.data.service, "addita");
   assert.equal(verRes.data.version, "0.1.0");
-  ok("GET /, /health, /api/version and X-Request-Id header echoing");
+  ok("GET /, /health (with readiness), /api/version and X-Request-Id header echoing");
 
-  // 10. POST /api/decide with lume.sql_judge preset + verbatim student answers + addita block (cloud ok -> cloud answers)
+  // 10. POST /api/decide with lume.sql_judge preset + verbatim student answers + addita block + done_reason: "decide" + timings
   const sqlJudgeRes = await httpJson("/api/decide", {
     body: {
       model: "laya",
@@ -272,10 +286,17 @@ try {
         answer: "There are 42 rows.",
       },
       extras: ["laya"],
-      addita: { ref: "ti:q_9f3a" },
+      addita: { ref: "ti:q_9f3a", allow_cloud_teacher: false }, // unknown addita field is harmlessly ignored
     },
   });
   assert.equal(sqlJudgeRes.status, 200);
+  assert.equal(sqlJudgeRes.data.done_reason, "decide");
+  assert.equal(sqlJudgeRes.data.eval_duration, 1_100_000, "eval_duration must preserve student's eval_duration");
+  assert.ok(
+    sqlJudgeRes.data.total_duration >= sqlJudgeRes.data.eval_duration &&
+      sqlJudgeRes.data.total_duration !== 1_200_000,
+    `total_duration (${sqlJudgeRes.data.total_duration}) must be Addita's actual wall time, not copied from student (1_200_000)`,
+  );
   assert.equal(sqlJudgeRes.data.answers.rows_answer_question.type, "noul");
   assert.equal(typeof sqlJudgeRes.data.answers.rows_answer_question.noul, "number");
   assert.ok(sqlJudgeRes.data.answers.rows_answer_question.laya);
@@ -287,7 +308,9 @@ try {
   assert.equal(sqlJudgeRes.data.addita.final.rows_answer_question, true);
   assert.equal(sqlJudgeRes.data.addita.final.answer_supported, true);
   assert.ok(sqlJudgeRes.data.addita.teacher_answers);
-  ok("POST /api/decide (lume.sql_judge): verbatim student answers + addita block (cloud ok -> cloud answers)");
+  assert.equal(typeof sqlJudgeRes.data.addita.student_ms, "number");
+  assert.equal(typeof sqlJudgeRes.data.addita.teacher_ms, "number");
+  ok("POST /api/decide (lume.sql_judge): verbatim student answers + done_reason='decide' + wall total_duration + student_ms/teacher_ms + addita block");
 
   // 11. GET /api/addita/decision/:id and POST /api/addita/label
   const decId = sqlJudgeRes.data.addita.id;
@@ -315,7 +338,7 @@ try {
   assert.equal(poll2.data.final.answer_supported, false);
   ok("GET /api/addita/decision/:id and POST /api/addita/label update final to human");
 
-  // 12. POST /v1/systemone and POST /v1/decisions (pure TypeSafe shape, no addita block, no laya extra)
+  // 12. POST /v1/systemone and POST /v1/decisions (pure TypeSafe shape, embedded questions, STATE_TRUNCATED durable row, MODEL_NOT_FOUND)
   const v1Res = await httpJson("/v1/systemone", {
     headers: { "x-request-id": "v1-req-42" },
     body: {
@@ -345,37 +368,44 @@ try {
   assert.equal(v1DecRes.status, 200);
   assert.deepEqual(Object.keys(v1DecRes.data).sort(), ["answers", "model", "usage"]);
 
-  // STATE_TRUNCATED on /v1/systemone returns 422 STATE_TRUNCATED
+  // /v1/decisions with omitted `questions` falls back to model's embedded questions via /api/show
+  const v1EmbeddedRes = await httpJson("/v1/decisions", {
+    body: {
+      model: "embedded-model",
+      state: "Charlie Bravo, embedded check",
+    },
+  });
+  assert.equal(v1EmbeddedRes.status, 200);
+  assert.equal(v1EmbeddedRes.data.answers.embedded_q.type, "noul");
+
+  // /v1/systemone with missing model -> 404 MODEL_NOT_FOUND
+  const v1MissingModel = await httpJson("/v1/systemone", {
+    body: {
+      model: "missing-model",
+      state: "hello",
+      questions: { q1: { type: "noul" } },
+    },
+  });
+  assert.equal(v1MissingModel.status, 404);
+  assert.equal(v1MissingModel.data.code, "MODEL_NOT_FOUND");
+
+  // STATE_TRUNCATED on /v1/systemone returns 422 STATE_TRUNCATED AND persists DecisionRow
   const truncV1 = await httpJson("/v1/systemone", {
     body: {
       model: "laya",
       state: "please __truncate__ this state",
       questions: { q1: { type: "noul" } },
+      addita: { ref: "v1-truncated-ref" },
     },
   });
   assert.equal(truncV1.status, 422);
   assert.equal(truncV1.data.code, "STATE_TRUNCATED");
-  ok("/v1/systemone and /v1/decisions return pure {model, answers, usage} and 422 STATE_TRUNCATED");
+  const truncRow = readDecisionsJsonl().find((r) => r.ref === "v1-truncated-ref");
+  assert.ok(truncRow, "DecisionRow must be persisted even when /v1 returns 422 STATE_TRUNCATED");
+  assert.equal(truncRow.teacher_status, "answered");
+  ok("/v1/systemone and /v1/decisions: pure {model, answers, usage}, embedded questions, MODEL_NOT_FOUND, and durable row on 422 STATE_TRUNCATED");
 
-  // 13. Dual-teacher policy (cloud disallowed -> local answers; cloud fails -> local answers; per-teacher stats)
-  const callsBeforeDisallowed = ollama.calls.length;
-  const cloudDisallowed = await httpJson("/api/decide", {
-    body: {
-      model: "laya",
-      preset: "lume.sql_judge",
-      state: { question: "q", sql: "SELECT 42", rows: [42], answer: "42" },
-      addita: { allow_cloud_teacher: false },
-    },
-  });
-  assert.equal(cloudDisallowed.status, 200);
-  assert.equal(cloudDisallowed.data.addita.teacher, "answered");
-  assert.equal(cloudDisallowed.data.addita.teacher_model, "qwen3.5:4b");
-  assert.equal(cloudDisallowed.data.addita.teacher_host, `127.0.0.1:${OLLAMA_PORT}`);
-  assert.equal(cloudDisallowed.data.addita.source, "teacher");
-  assert.equal(ollama.calls.length, callsBeforeDisallowed + 1);
-  assert.equal(ollama.calls.at(-1).model, "qwen3.5:4b", "cloud must not be called when allow_cloud_teacher=false");
-
-  // Cloud fails -> falls back to local teacher on the same call
+  // 13. Cloud fails -> local answers (cloud_pending: true), then backfill re-asks cloud once it's up
   ollama.state.failCloud = true;
   const callsBeforeFail = ollama.calls.length;
   const cloudFailedFallback = await httpJson("/api/decide", {
@@ -383,26 +413,116 @@ try {
       model: "laya",
       preset: "lume.sql_judge",
       state: { question: "q", sql: "SELECT 42", rows: [42], answer: "42" },
+      addita: { ref: "cloud-pending-ref" },
     },
   });
   assert.equal(cloudFailedFallback.status, 200);
   assert.equal(cloudFailedFallback.data.addita.teacher, "answered");
   assert.equal(cloudFailedFallback.data.addita.teacher_model, "qwen3.5:4b");
   assert.equal(cloudFailedFallback.data.addita.teacher_host, `127.0.0.1:${OLLAMA_PORT}`);
+  assert.equal(cloudFailedFallback.data.addita.cloud_pending, true);
   assert.equal(cloudFailedFallback.data.addita.source, "teacher");
-  assert.equal(ollama.calls.length, callsBeforeFail + 2, "must try cloud first then fall back to local on the same call");
+  assert.equal(ollama.calls.length, callsBeforeFail + 2, "must try cloud first then fall back to local immediately");
   assert.equal(ollama.calls.at(-2).model, "deepseek-v4.1-flash:cloud");
   assert.equal(ollama.calls.at(-1).model, "qwen3.5:4b");
+
+  // Now cloud is back up -> backfill re-asks cloud for the cloud-pending row
   ollama.state.failCloud = false;
+  const callsBeforeCloudBackfill = ollama.calls.length;
+  const bfCloud = await call("training_backfill", {});
+  assert.equal(bfCloud.labelled, 1, "backfill must re-ask cloud for the cloud-pending row");
+  assert.equal(bfCloud.remaining, 0);
+  assert.equal(ollama.calls.length, callsBeforeCloudBackfill + 1);
+  assert.equal(ollama.calls.at(-1).model, "deepseek-v4.1-flash:cloud");
 
-  // Verify stats splits agreement by teacher
-  const sAfterDual = await call("training_stats");
-  assert.ok(sAfterDual.by_teacher["deepseek-v4.1-flash:cloud"].decisions >= 4);
-  assert.ok(sAfterDual.by_teacher["qwen3.5:4b"].decisions >= 2);
-  ok("dual-teacher policy: cloud disallowed -> local answers; cloud fails -> local answers; stats split by teacher");
+  // Poll the decision: teacher_model is now the cloud teacher and cloud_pending is cleared
+  const pollAfterCloudBackfill = await httpJson(`/api/addita/decision/${cloudFailedFallback.data.addita.id}`);
+  assert.equal(pollAfterCloudBackfill.status, 200);
+  assert.equal(pollAfterCloudBackfill.data.teacher_model, "deepseek-v4.1-flash:cloud");
+  assert.equal(pollAfterCloudBackfill.data.cloud_pending, undefined);
+  ok("cloud fails -> local teacher answers immediately (cloud_pending), then backfill upgrades to cloud once it's up");
 
-  // 14. Outage resilience: Ollaya down, and both Ollaya + Ollama down (neither -> pending)
+  // 14. ADDITA_NO_CLOUD=true -> zero cloud calls, including backfill
+  const noCloudDataDir = mkdtempSync(join(tmpdir(), "addita-nocloud-"));
+  const noCloudClient = new Client({ name: "smoke-nocloud", version: "0" });
+  await noCloudClient.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: ["dist/index.js"],
+      env: {
+        ...process.env,
+        ADDITA_HOST: "127.0.0.1",
+        ADDITA_PORT: "0",
+        ADDITA_NO_CLOUD: "true",
+        OLLAYA_URL: `http://127.0.0.1:${OLLAYA_PORT}`,
+        OLLAMA_URL: `http://127.0.0.1:${OLLAMA_PORT}`,
+        OLLAMA_PROBE_TTL_MS: "0",
+        ADDITA_DATA_DIR: noCloudDataDir,
+        LUME_SERVE_JSON: lumeServeJson,
+      },
+      stderr: "ignore",
+    }),
+  );
+  try {
+    const callNoCloud = async (name, args = {}) => {
+      const r = await noCloudClient.callTool({ name, arguments: args });
+      if (r.isError) throw new Error(r.content[0].text);
+      return JSON.parse(r.content[0].text);
+    };
+    const callsStart = ollama.calls.length;
+    const ncLive = await callNoCloud("comms_decide", {
+      state: { ...base, transcript: "Charlie Bravo, local-only check." },
+    });
+    assert.equal(ncLive.teacher.model, "qwen3.5:4b");
+    assert.equal(ollama.calls.length, callsStart + 1);
+    assert.equal(ollama.calls.at(-1).model, "qwen3.5:4b", "ADDITA_NO_CLOUD=true must never call cloud on live decide");
+
+    // Take Ollama offline, record a pending row, bring Ollama back, run backfill under ADDITA_NO_CLOUD=true
+    await new Promise((r) => ollama.server.close(r));
+    const ncOffline = await callNoCloud("comms_decide", {
+      state: { ...base, transcript: "Charlie Bravo, offline local-only row." },
+    });
+    assert.equal(ncOffline.teacher.status, "offline");
+    ollama = await mockOllama(OLLAMA_PORT);
+
+    const callsBeforeNcBf = ollama.calls.length;
+    const ncBf = await callNoCloud("training_backfill", {});
+    assert.equal(ncBf.labelled, 1);
+    assert.equal(ollama.calls.length, callsBeforeNcBf + 1);
+    assert.equal(ollama.calls.at(-1).model, "qwen3.5:4b", "ADDITA_NO_CLOUD=true must never call cloud on backfill");
+    const anyCloudCalls = ollama.calls.slice(callsBeforeNcBf).filter((c) => String(c.model).includes("cloud"));
+    assert.equal(anyCloudCalls.length, 0);
+  } finally {
+    await noCloudClient.close();
+    rmSync(noCloudDataDir, { recursive: true, force: true });
+  }
+  ok("ADDITA_NO_CLOUD=true -> zero cloud calls on both live decisions and backfill");
+
+  // 15. Outage resilience & #5 error propagation: Ollaya down (/api/decide degrades, /v1 and lifecycle return 503), both down
   await new Promise((r) => ollaya.server.close(r));
+
+  // #5: Lifecycle request on /api/decide when Ollaya is down must NOT fabricate a 200 load response
+  const lifecycleDown = await httpJson("/api/decide", {
+    body: { model: "laya", keep_alive: "5m" },
+  });
+  assert.equal(lifecycleDown.status, 503);
+  assert.equal(lifecycleDown.data.code, "INTERNAL");
+
+  // #5: /v1/systemone when Ollaya is down must return 503 INTERNAL (never an empty 200) while still persisting the DecisionRow
+  const v1Down = await httpJson("/v1/systemone", {
+    body: {
+      model: "laya",
+      state: "Charlie Bravo, v1 while ollaya down",
+      questions: { q1: { type: "noul" } },
+      addita: { ref: "v1-ollaya-down" },
+    },
+  });
+  assert.equal(v1Down.status, 503);
+  assert.equal(v1Down.data.code, "INTERNAL");
+  const v1DownRow = readDecisionsJsonl().find((r) => r.ref === "v1-ollaya-down");
+  assert.ok(v1DownRow, "DecisionRow must be persisted when /v1 fails due to Ollaya outage");
+  assert.equal(v1DownRow.final_source, "teacher");
+
   const studentDown = await httpJson("/api/decide", {
     body: {
       model: "laya",
@@ -443,9 +563,9 @@ try {
 
   ollaya = await mockOllaya(OLLAYA_PORT);
   ollama = await mockOllama(OLLAMA_PORT);
-  ok("outage resilience: works with Ollaya down, Ollama down (pending), and both down (guards + no fake probs)");
+  ok("outage resilience: /api/decide degrades cleanly, /v1 and lifecycle return 503 INTERNAL when Ollaya is down");
 
-  // 15. Upstream boundary validation & error codes (400, 404, 405, 422, 501)
+  // 16. Upstream boundary validation & error codes (INVALID_JSON, INVALID_REQUEST, NOT_FOUND, METHOD_NOT_ALLOWED, NOT_IMPLEMENTED)
   const err400Empty = await httpJson("/api/decide", { method: "POST", body: "" });
   assert.equal(err400Empty.status, 400);
   assert.equal(err400Empty.data.code, "INVALID_JSON");
@@ -468,7 +588,7 @@ try {
     body: { model: "laya", state: "hi", preset: "comms", stream: true },
   });
   assert.equal(err422Stream.status, 422);
-  assert.equal(err422Stream.data.code, "UNPROCESSABLE_REQUEST");
+  assert.equal(err422Stream.data.code, "INVALID_REQUEST");
   assert.equal(err422Stream.data.detail[0].type, "stream_unsupported");
 
   const err422Mutual = await httpJson("/api/decide", {
@@ -480,6 +600,7 @@ try {
     },
   });
   assert.equal(err422Mutual.status, 422);
+  assert.equal(err422Mutual.data.code, "INVALID_REQUEST");
   assert.deepEqual(err422Mutual.data.detail[0].loc, ["body", "preset"]);
 
   const err422Tag = await httpJson("/api/decide", {
@@ -490,6 +611,7 @@ try {
     },
   });
   assert.equal(err422Tag.status, 422);
+  assert.equal(err422Tag.data.code, "INVALID_REQUEST");
   assert.equal(err422Tag.data.detail[0].type, "union_tag_invalid");
   assert.deepEqual(err422Tag.data.detail[0].loc, ["body", "questions", "q"]);
 
@@ -499,9 +621,9 @@ try {
 
   const err501Blob = await httpJson("/api/blobs/sha256:deadbeef", { method: "HEAD" });
   assert.equal(err501Blob.status, 501);
-  ok("boundary validation & error codes (400, 404, 405, 422, 501) match upstream contract");
+  ok("boundary validation & error codes (INVALID_JSON, INVALID_REQUEST, MODEL_NOT_FOUND, NOT_IMPLEMENTED) match upstream contract");
 
-  // 16. Forwarded endpoints & NDJSON streaming passthrough
+  // 17. Forwarded endpoints & NDJSON streaming passthrough
   const tagsRes = await httpJson("/api/tags");
   assert.equal(tagsRes.status, 200);
   assert.equal(tagsRes.data.models[0].name, "laya:latest");
@@ -525,7 +647,7 @@ try {
   assert.equal(pullLines.at(-1).status, "success");
   ok("forwarded Ollaya endpoints + NDJSON streaming passthrough (/api/pull)");
 
-  // 17. OTLP /v1/logs and /v1/metrics verification
+  // 18. OTLP /v1/logs and /v1/metrics verification
   await new Promise((r) => setTimeout(r, 100));
   assert.ok(lumeOtlp.logs.length >= 2, `expected OTLP logs, got ${lumeOtlp.logs.length}`);
   assert.ok(lumeOtlp.metrics.length >= 1, `expected OTLP metrics, got ${lumeOtlp.metrics.length}`);
@@ -544,7 +666,7 @@ try {
   assert.ok(metricNames.has("addita.decide.ms") && metricNames.has("addita.decide.count"));
   ok("OTLP /v1/logs (addita.decision, addita.decision.final, addita.label) and /v1/metrics verified");
 
-  // 18. Streamable HTTP MCP transport on /mcp
+  // 19. Streamable HTTP MCP transport on /mcp
   const httpMcpClient = new Client({ name: "smoke-http", version: "0" });
   await httpMcpClient.connect(new StreamableHTTPClientTransport(new URL(`${HTTP_BASE}/mcp`)));
   const httpTools = (await httpMcpClient.listTools()).tools.map((t) => t.name);
@@ -554,6 +676,138 @@ try {
   assert.ok(judgePresetParsed.questions.rows_answer_question);
   await httpMcpClient.close();
   ok("MCP over Streamable HTTP (/mcp) connected and executed tools");
+
+  // 20. Real Ollaya contract test mode (runs automatically when OLLAYA_URL or host.docker.internal:11435 is reachable)
+  let realOllayaUrl = null;
+  for (const cand of [process.env.OLLAYA_URL, "http://host.docker.internal:11435", "http://127.0.0.1:11435"].filter(Boolean)) {
+    try {
+      const r = await fetch(`${cand.replace(/\/+$/, "")}/api/version`, { signal: AbortSignal.timeout(1500) });
+      if (r.ok) {
+        const v = await r.json();
+        if (v?.version && !String(v.version).includes("mock")) {
+          realOllayaUrl = cand.replace(/\/+$/, "");
+          break;
+        }
+      }
+    } catch {
+      /* not reachable */
+    }
+  }
+
+  if (realOllayaUrl) {
+    let realOllamaUrl = `http://127.0.0.1:${OLLAMA_PORT}`;
+    for (const cand of [process.env.OLLAMA_URL, "http://host.docker.internal:11434"].filter(Boolean)) {
+      try {
+        const r = await fetch(`${cand.replace(/\/+$/, "")}/api/version`, { signal: AbortSignal.timeout(1500) });
+        if (r.ok) {
+          const v = await r.json();
+          if (v?.version && !String(v.version).includes("mock")) {
+            realOllamaUrl = cand.replace(/\/+$/, "");
+            break;
+          }
+        }
+      } catch {
+        /* use mock ollama if real ollama is not reachable */
+      }
+    }
+
+    const livePort = 21349;
+    const liveDataDir = mkdtempSync(join(tmpdir(), "addita-live-"));
+    const tLaunch = Date.now();
+    const child = spawn(process.execPath, ["dist/index.js"], {
+      env: {
+        ...process.env,
+        ADDITA_HOST: "127.0.0.1",
+        ADDITA_PORT: String(livePort),
+        OLLAYA_URL: realOllayaUrl,
+        OLLAMA_URL: realOllamaUrl,
+        ADDITA_LUME: "off",
+        ADDITA_DATA_DIR: liveDataDir,
+        LUME_SERVE_JSON: lumeServeJson,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    try {
+      let startupMs = -1;
+      for (let i = 0; i < 200; i++) {
+        try {
+          const hr = await fetch(`http://127.0.0.1:${livePort}/health`, { signal: AbortSignal.timeout(200) });
+          if (hr.status === 200) {
+            startupMs = Date.now() - tLaunch;
+            break;
+          }
+        } catch {
+          /* wait for listener */
+        }
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      assert.ok(startupMs >= 0 && startupMs < 2000, `expected HTTP listener ready in <2000ms, got ${startupMs}ms`);
+
+      // Wait for background readiness probe to complete
+      let healthBody = null;
+      for (let i = 0; i < 100; i++) {
+        const hr = await fetch(`http://127.0.0.1:${livePort}/health`);
+        healthBody = await hr.json();
+        if (healthBody?.ready) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(healthBody?.ready, true, "expected /health ready=true after background probe");
+      assert.equal(healthBody?.ollaya, true, "expected /health ollaya=true against real Ollaya");
+
+      const judgePreset = JSON.parse(readFileSync(join(process.cwd(), "presets", "lume.sql_judge.json"), "utf8"));
+      const liveState = {
+        question: "How many rows are in telemetry?",
+        sql: "SELECT count(*) AS n FROM telemetry",
+        rows: [{ n: 42 }],
+        answer: "There are 42 rows in telemetry.",
+      };
+
+      const directRes = await fetch(`${realOllayaUrl}/api/decide`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "laya",
+          state: liveState,
+          questions: judgePreset.questions,
+        }),
+      });
+      assert.equal(directRes.status, 200);
+      const directData = await directRes.json();
+
+      const viaAdditaRes = await fetch(`http://127.0.0.1:${livePort}/api/decide`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "laya",
+          preset: "lume.sql_judge",
+          state: liveState,
+          addita: { ref: "real-ollaya-contract" },
+        }),
+      });
+      assert.equal(viaAdditaRes.status, 200);
+      const viaData = await viaAdditaRes.json();
+
+      assert.equal(JSON.stringify(viaData.answers), JSON.stringify(directData.answers), "student answers through Addita must be byte-identical to direct Ollaya");
+      assert.equal(viaData.model, directData.model);
+      assert.equal(viaData.done_reason, "decide");
+      assert.deepEqual(viaData.routing, directData.routing);
+      assert.ok(viaData.eval_duration > 0, "eval_duration must keep student's eval_duration");
+      assert.ok(viaData.total_duration >= viaData.eval_duration, "total_duration must be Addita's actual wall time (>= eval_duration)");
+      assert.equal(typeof viaData.addita.student_ms, "number");
+      assert.equal(typeof viaData.addita.teacher_ms, "number");
+      ok(
+        `real Ollaya contract (${realOllayaUrl}, teacher ${realOllamaUrl}): listener up in ${startupMs}ms, byte-identical answers (${viaData.model}), student_ms=${viaData.addita.student_ms}ms, teacher_ms=${viaData.addita.teacher_ms}ms, eval_duration=${(viaData.eval_duration / 1e6).toFixed(1)}ms, total_duration=${(viaData.total_duration / 1e6).toFixed(1)}ms`,
+      );
+    } finally {
+      await new Promise((r) => {
+        if (child.exitCode !== null) return r();
+        child.once("exit", r);
+        child.kill("SIGTERM");
+      });
+      rmSync(liveDataDir, { recursive: true, force: true });
+    }
+  }
 
   console.log("\nall smoke tests passed");
 } finally {

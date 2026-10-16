@@ -32,6 +32,10 @@ export interface DecisionRow {
   teacher_status?: "answered" | "pending" | "skipped" | "failed";
   teacher_model?: string;
   teacher_host?: string;
+  /** True when local teacher answered because the primary cloud teacher failed; backfill will re-ask cloud. */
+  cloud_pending?: boolean;
+  student_ms?: number;
+  teacher_ms?: number;
   final: SimpleAnswers;
   final_source: "teacher" | "student" | "guard" | "none";
   guards: string[];
@@ -47,6 +51,8 @@ export interface TeacherRow {
   latency_ms: number;
   saw_student: boolean;
   backfill: boolean;
+  /** True when this row came from the local fallback after a cloud teacher failure; cleared once cloud answers on backfill. */
+  cloud_pending?: boolean;
 }
 
 export interface LabelRow {

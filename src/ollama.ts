@@ -82,18 +82,16 @@ export async function isOnline(force = false): Promise<boolean> {
   const now = Date.now();
   if (!force && probe && now - probe.at < config.ollamaProbeTtlMs) return probe.online;
   try {
-    const v = await requestJson<{ version: string }>(url("/api/version"), { timeoutMs: 1500 });
+    const [v, tags] = await Promise.all([
+      requestJson<{ version: string }>(url("/api/version"), { timeoutMs: 1500 }),
+      requestJson<any>(url("/api/tags"), { timeoutMs: 1500 }).catch(() => null),
+    ]);
     const remoteHosts = new Map<string, string>();
-    try {
-      const tags = await requestJson<any>(url("/api/tags"), { timeoutMs: 1500 });
-      for (const m of tags?.models ?? []) {
-        const rh = m?.remote_host ?? m?.details?.remote_host;
-        if (typeof m?.name === "string" && typeof rh === "string" && rh) {
-          remoteHosts.set(m.name, rh);
-        }
+    for (const m of tags?.models ?? []) {
+      const rh = m?.remote_host ?? m?.details?.remote_host;
+      if (typeof m?.name === "string" && typeof rh === "string" && rh) {
+        remoteHosts.set(m.name, rh);
       }
-    } catch {
-      /* /api/tags is optional during reachability probe */
     }
     probe = { at: now, online: true, version: v?.version, remoteHosts };
   } catch (e: any) {
@@ -116,27 +114,34 @@ export async function teacherInfo(model = config.ollamaModel): Promise<TeacherCa
 }
 
 /**
- * Ordered list of usable teacher candidates for a request:
- *   1. Primary teacher (`config.ollamaModel`, default `deepseek-v4.1-flash:cloud`) if allowed.
- *   2. Local fallback teacher (`config.ollamaLocalModel`, default `qwen3.5:4b`) if distinct and allowed.
+ * Ordered list of usable teacher candidates based on `config.noCloud`:
+ *   - When `config.noCloud === true`: never include any cloud teacher; only local teacher is returned.
+ *   - When `config.noCloud === false`: primary teacher (`config.ollamaModel`) first, then local fallback (`config.ollamaLocalModel`).
  */
-export async function resolveTeacherCandidates(allowCloud: boolean): Promise<{
+export async function resolveTeacherCandidates(opts: { onlyCloud?: boolean } = {}): Promise<{
   candidates: TeacherCandidate[];
   defaultInfo: TeacherCandidate;
+  hadCloudPrimary: boolean;
 }> {
+  const allowCloud = !config.noCloud;
   const primary = await teacherInfo(config.ollamaModel);
   const localModel = config.ollamaLocalModel?.trim();
   const local = localModel && localModel !== config.ollamaModel ? await teacherInfo(localModel) : undefined;
 
   const candidates: TeacherCandidate[] = [];
-  if (!primary.isCloud || allowCloud) {
-    candidates.push(primary);
+  if (!opts.onlyCloud) {
+    if (!primary.isCloud || allowCloud) {
+      candidates.push(primary);
+    }
+    if (local && (!local.isCloud || allowCloud)) {
+      candidates.push(local);
+    }
+  } else if (allowCloud) {
+    if (primary.isCloud) candidates.push(primary);
+    else if (local && local.isCloud) candidates.push(local);
   }
-  if (local && (!local.isCloud || allowCloud)) {
-    candidates.push(local);
-  }
-  const defaultInfo = candidates[0] ?? local ?? primary;
-  return { candidates, defaultInfo };
+  const defaultInfo = candidates[0] ?? (allowCloud ? primary : local ?? primary);
+  return { candidates, defaultInfo, hadCloudPrimary: allowCloud && primary.isCloud };
 }
 
 export function lastProbe() {

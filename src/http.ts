@@ -3,6 +3,9 @@ export class HttpError extends Error {
     message: string,
     readonly status?: number,
     readonly code?: string,
+    readonly detail?: unknown[],
+    readonly rawError?: string,
+    readonly headers?: Record<string, string>,
   ) {
     super(message);
   }
@@ -31,7 +34,21 @@ export async function requestJson<T = any>(
     }
     if (!res.ok) {
       const msg = typeof data === "object" && data?.error ? String(data.error) : raw.slice(0, 300);
-      throw new HttpError(`${res.status} from ${url}: ${msg}`, res.status, data?.code);
+      const code = typeof data === "object" && typeof data?.code === "string" ? data.code : undefined;
+      const detail = typeof data === "object" && Array.isArray(data?.detail) ? data.detail : undefined;
+      const headers: Record<string, string> = {};
+      for (const h of ["allow", "retry-after", "www-authenticate"]) {
+        const v = res.headers.get(h);
+        if (v) headers[h] = v;
+      }
+      throw new HttpError(
+        `${res.status} from ${url}: ${msg}`,
+        res.status,
+        code,
+        detail,
+        msg || `HTTP ${res.status}`,
+        Object.keys(headers).length ? headers : undefined,
+      );
     }
     return data as T;
   } catch (e: any) {

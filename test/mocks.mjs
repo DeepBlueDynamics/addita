@@ -1,8 +1,8 @@
 // Tiny stand-ins for the Ollaya, Ollama, and Lume OTLP HTTP APIs, for the smoke test.
 import { createServer } from "node:http";
 
-function json(res, code, body) {
-  res.writeHead(code, { "content-type": "application/json" });
+function json(res, code, body, extraHeaders = {}) {
+  res.writeHead(code, { "content-type": "application/json", ...extraHeaders });
   res.end(JSON.stringify(body));
 }
 
@@ -31,7 +31,21 @@ export function mockOllaya(port) {
     if (req.url === "/api/tags") return json(res, 200, { models: [{ name: "laya:latest", details: { format: "router" } }] });
     if (req.url === "/api/ps") return json(res, 200, { models: [] });
     if (req.url === "/v1/models") return json(res, 200, { object: "list", data: [{ id: "laya:latest", object: "model" }] });
-    if (req.url === "/api/show") return json(res, 200, { model: body.model, details: { format: "router" }, questions: null });
+    if (req.url === "/api/show") {
+      if (body.model === "missing-model") {
+        return json(res, 404, { error: `model '${body.model}' not found`, code: "MODEL_NOT_FOUND" });
+      }
+      if (body.model === "embedded-model") {
+        return json(res, 200, {
+          model: body.model,
+          details: { format: "router" },
+          questions: {
+            embedded_q: { type: "noul", instructions: "Embedded question on model" },
+          },
+        });
+      }
+      return json(res, 200, { model: body.model, details: { format: "router" }, questions: null });
+    }
     if (req.url === "/api/presets") return json(res, 200, { presets: [] });
     if (req.url === "/api/presets/show") return json(res, 404, { error: `preset '${body.name}' not found`, code: "NOT_FOUND" });
     if (req.url === "/api/pull") {
@@ -45,18 +59,28 @@ export function mockOllaya(port) {
     }
     if (req.url === "/api/create") {
       created.push(body);
+      if (body.stream !== false) {
+        res.writeHead(200, { "content-type": "application/x-ndjson" });
+        res.write(JSON.stringify({ status: `building ${body.model}` }) + "\n");
+        res.end(JSON.stringify({ status: "success" }) + "\n");
+        return;
+      }
       return json(res, 200, { status: "success" });
     }
     if (req.url === "/api/decide") {
       decides.push(body);
+      if (body.model === "missing-model") {
+        return json(res, 404, { error: `model '${body.model}' not found`, code: "MODEL_NOT_FOUND" });
+      }
       if (body.state === undefined || body.state === null) {
+        const isUnload = body.keep_alive === 0 || body.keep_alive === "0" || body.keep_alive === "0s" || body.keep_alive === "-0s";
         return json(res, 200, {
           model: body.model,
           answers: {},
           usage: { input_tokens: 0, output_tokens: 0 },
           routing: null,
           state_truncated: false,
-          done_reason: body.keep_alive === 0 ? "unload" : "load",
+          done_reason: isUnload ? "unload" : "load",
           created_at: new Date().toISOString(),
           total_duration: 100,
           load_duration: 100,
@@ -85,7 +109,7 @@ export function mockOllaya(port) {
         usage: { input_tokens: 50, output_tokens: 0 },
         routing: null,
         state_truncated: stateTruncated,
-        done_reason: "complete",
+        done_reason: "decide",
         created_at: new Date().toISOString(),
         total_duration: 1200000,
         load_duration: 100000,
@@ -100,11 +124,14 @@ export function mockOllaya(port) {
 /** Ollama mock: answers the `format` schema; picks the last enum value, true, top level. */
 export function mockOllama(port, opts = {}) {
   const calls = [];
-  const state = { failCloud: opts.failCloud ?? false };
+  const state = { failCloud: opts.failCloud ?? false, failTags: opts.failTags ?? false };
   const server = createServer(async (req, res) => {
     const body = req.method === "POST" ? await readBody(req) : {};
     if (req.url === "/api/version") return json(res, 200, { version: "0.35.0-mock" });
     if (req.url === "/api/tags") {
+      if (state.failTags) {
+        return json(res, 500, { error: "tags endpoint failed" });
+      }
       return json(res, 200, {
         models: [
           { name: "deepseek-v4.1-flash:cloud", remote_host: "https://ollama.com" },
