@@ -711,6 +711,7 @@ export function validateQuestionsMap(v: unknown, issues: ValidationIssue[]): Que
 
 export interface AdditaRequestOptions {
   ref?: string;
+  group?: string;
 }
 
 export interface ValidatedDecideRequest {
@@ -744,6 +745,13 @@ function validateAdditaBlock(v: unknown, issues: ValidationIssue[]): AdditaReque
       issues.push(issue("string_type", [...loc, "ref"], "Input should be a valid string"));
     } else {
       out.ref = v.ref;
+    }
+  }
+  if (v.group !== undefined && v.group !== null) {
+    if (typeof v.group !== "string") {
+      issues.push(issue("string_type", [...loc, "group"], "Input should be a valid string"));
+    } else if (v.group.trim()) {
+      out.group = v.group.trim();
     }
   }
   // Unknown fields inside `addita` (such as legacy `allow_cloud_teacher`) are ignored harmlessly.

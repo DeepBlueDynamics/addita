@@ -118,7 +118,10 @@ try {
   ok("both backends online, default teachers deepseek-v4.1-flash:cloud + qwen3.5:4b, presets discovered");
 
   // 1. online: student first, cloud teacher answers by default, teacher wins
-  const d1 = await call("comms_decide", { state: { ...base, transcript: "Charlie Bravo, this is Alpha Tango, come in, over." } });
+  const d1 = await call("comms_decide", {
+    state: { ...base, transcript: "Charlie Bravo, this is Alpha Tango, come in, over." },
+    group: "train-grp-2",
+  });
   assert.equal(d1.source, "teacher");
   assert.equal(d1.teacher.model, "deepseek-v4.1-flash:cloud");
   assert.equal(d1.student.answers.priority, "distress"); // mock student picks the first label
@@ -135,7 +138,10 @@ try {
   ok("teacher answered blind");
 
   // 2. guard overrides both
-  const d2 = await call("comms_decide", { state: { ...base, transcript: "Mayday mayday mayday, Charlie Bravo this is Blue Heron, taking on water" } });
+  const d2 = await call("comms_decide", {
+    state: { ...base, transcript: "Mayday mayday mayday, Charlie Bravo this is Blue Heron, taking on water" },
+    group: "train-grp-3",
+  });
   assert.equal(d2.source, "guard");
   assert.deepEqual(d2.guards, ["distress_keyword"]);
   assert.equal(d2.answers.priority, "distress");
@@ -150,7 +156,10 @@ try {
 
   // 3. offline: student only, row kept for backfill; Lume still logs and supplies context
   await new Promise((r) => ollama.server.close(r));
-  const d3 = await call("comms_decide", { state: { ...base, transcript: "Charlie Bravo, I need a wind check." } });
+  const d3 = await call("comms_decide", {
+    state: { ...base, transcript: "Charlie Bravo, I need a wind check." },
+    group: "eval-grp-9",
+  });
   assert.equal(d3.source, "student");
   assert.equal(d3.teacher.status, "offline");
   ok("offline: falls back to Ollaya");
@@ -208,20 +217,55 @@ try {
   assert.equal(s.with_teacher, 3);
   assert.equal(s.human_labelled, 1);
   assert.equal(s.guard_hits.distress_keyword, 1);
+  assert.deepEqual(s.final_source, { human: 1, teacher: 1, guard: 1 });
+  assert.deepEqual(s.label_source, { human: 3, teacher: 10, guard: 2 });
   assert.equal(s.by_teacher["deepseek-v4.1-flash:cloud"].decisions, 3);
-  ok(`stats: ${JSON.stringify(s.questions.priority)}`);
+  ok(`stats: ${JSON.stringify(s.questions.priority)}, sources: ${JSON.stringify(s.label_source)}`);
 
   const dis = await call("training_disagreements", { limit: 5 });
   assert.ok(dis.length >= 1 && dis[0].diff.priority.reason);
   ok(`${dis.length} disagreement(s) to review`);
 
-  const ex = await call("training_export", { eval_fraction: 1 });
+  const ex = await call("training_export", { eval_fraction: 0.3 });
   assert.equal(ex.eval, 1);
   assert.equal(ex.train, 2);
+  assert.equal(ex.calibration, 0);
+  assert.equal(ex.eval_groups, 1);
+  assert.equal(ex.train_groups, 2);
+  assert.equal(ex.calibration_groups, 0);
+  assert.equal(ex.held_out_unlabelled, 0);
+  assert.deepEqual(ex.groups, { train: 2, eval: 1, calibration: 0 });
   const evalRow = JSON.parse(readFileSync(join(ex.dir, "eval.jsonl"), "utf8").trim());
   assert.equal(evalRow.label_source.intent, "human");
-  assert.equal(evalRow.label_source.priority, "teacher");
-  ok("export: eval is human-labelled only, human labels outrank teacher");
+  assert.equal(evalRow.labels.priority, undefined);
+  assert.ok(Object.values(evalRow.label_source).every((v) => v === "human"));
+  assert.equal(evalRow.teacher_labels, undefined);
+  assert.equal(evalRow.group, "eval-grp-9");
+  assert.equal(evalRow.preset, "comms");
+  assert.equal(evalRow.teacher_model, "deepseek-v4.1-flash:cloud");
+  assert.equal(typeof evalRow.created_at, "string");
+
+  const trainRows = readFileSync(join(ex.dir, "train.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const guardTrainRow = trainRows.find((r) => r.id === d2.id);
+  assert.ok(guardTrainRow, "guard row d2 must be exported in train.jsonl");
+  assert.equal(guardTrainRow.labels.priority, "distress");
+  assert.equal(guardTrainRow.labels.action, "alert_operator");
+  assert.equal(guardTrainRow.label_source.priority, "guard");
+  assert.equal(guardTrainRow.label_source.action, "guard");
+  assert.equal(guardTrainRow.label_source.addressed_to_us, "teacher");
+  assert.deepEqual(guardTrainRow.guard_overrides, {
+    priority: "distress_keyword",
+    action: "distress_keyword",
+  });
+  assert.equal(guardTrainRow.teacher_labels.priority, "noise");
+  assert.equal(guardTrainRow.teacher_labels.action, "alert_operator");
+  assert.equal(guardTrainRow.group, "train-grp-3");
+  assert.equal(guardTrainRow.preset, "comms");
+  assert.equal(guardTrainRow.teacher_model, "deepseek-v4.1-flash:cloud");
+  ok("export: eval carries human-only labels (no teacher keys), guard row exported as 'guard' with teacher_labels kept");
 
   const cal = await call("training_calibrate", {
     include_teacher: true,
@@ -676,6 +720,140 @@ try {
   assert.ok(judgePresetParsed.questions.rows_answer_question);
   await httpMcpClient.close();
   ok("MCP over Streamable HTTP (/mcp) connected and executed tools");
+
+  // 19b. P2 grouped split (pure group hash), held_out_unlabelled, calibration_fraction, manifest.json, teacher_model null when unanswered, and human-over-guard
+  // Default chain: sqlJudgeRes had ref="ti:q_9f3a" and no explicit group -> group defaults to ref
+  assert.equal(sqlJudgeRes.data.addita.group, "ti:q_9f3a");
+  assert.equal(poll2.data.group, "ti:q_9f3a");
+
+  // Fix 1 test: "eval-grp-9" hashes to 0.1796875 (< 0.3 eval band) and already has 1 partially human-labelled row (d3).
+  // Add 1 teacher-only row to "eval-grp-9": expect eval=1 row, train=0 rows from "eval-grp-9", and held_out_unlabelled incremented.
+  const evalGrpTeacherOnly = await call("comms_decide", {
+    preset: "lume.sql_judge",
+    state: { question: "Eval group teacher-only?", sql: "SELECT 9", rows: [9], answer: "9" },
+    group: "eval-grp-9",
+  });
+  assert.equal(evalGrpTeacherOnly.group, "eval-grp-9");
+
+  // Fix 2 test: "cal-grp-10" hashes to 0.41015625 (in [0.3, 0.5) calibration band when eval=0.3, cal=0.2)
+  const calGroup = "cal-grp-10";
+  const calRow1 = await httpJson("/api/decide", {
+    body: {
+      model: "laya",
+      preset: "lume.sql_judge",
+      state: { question: "Cal Q1?", sql: "SELECT 10", rows: [10], answer: "10" },
+      addita: { ref: "cal-ref-1", group: calGroup },
+    },
+  });
+  const calRow2 = await call("comms_decide", {
+    preset: "lume.sql_judge",
+    state: { question: "Cal Q2?", sql: "SELECT 11", rows: [11], answer: "11" },
+    ref: "cal-ref-2",
+    group: calGroup,
+  });
+  assert.equal(calRow1.data.addita.group, calGroup);
+  assert.equal(calRow2.group, calGroup);
+
+  // Two rows sharing a train group "train-grp-6" (hashes to 0.93359375 >= 0.5)
+  const sharedTrainGroup = "train-grp-6";
+  const grpHttpRes = await httpJson("/api/decide", {
+    body: {
+      model: "laya",
+      preset: "lume.sql_judge",
+      state: { question: "Q1?", sql: "SELECT 1", rows: [1], answer: "1" },
+      addita: { ref: "grp-ref-1", group: sharedTrainGroup },
+    },
+  });
+  const grpMcpRes = await call("comms_decide", {
+    preset: "lume.sql_judge",
+    state: { question: "Q2?", sql: "SELECT 2", rows: [2], answer: "2" },
+    ref: "grp-ref-2",
+    group: sharedTrainGroup,
+  });
+  await call("comms_label", { id: grpHttpRes.data.addita.id, labels: { rows_answer_question: true } });
+
+  // Fix 4 test: row where no teacher answered (teacher="skip"), partially human-labelled -> teacher_model must be null, missing label stays undefined
+  const noTeacherRow = await call("comms_decide", {
+    preset: "lume.sql_judge",
+    state: { question: "No teacher?", sql: "SELECT 0", rows: [0], answer: "0" },
+    teacher: "skip",
+    group: "train-grp-7", // hashes to 0.9140625 >= 0.5
+  });
+  await call("comms_label", { id: noTeacherRow.id, labels: { rows_answer_question: true } });
+
+  // Human-over-guard precedence: label `action` on the MAYDAY guard row d2 ("train-grp-3")
+  await call("comms_label", { id: d2.id, labels: { action: "draft_reply" } });
+
+  // Validate that eval_fraction + calibration_fraction >= 1 is rejected
+  await assert.rejects(
+    call("training_export", { eval_fraction: 0.8, calibration_fraction: 0.2 }),
+    /must be less than 1/,
+  );
+  await assert.rejects(call("training_export", { eval_fraction: 1 }), /must be in \[0, 1\)/);
+
+  const exGrouped = await call("training_export", { eval_fraction: 0.3, calibration_fraction: 0.2 });
+  const parseJsonl = (f) => {
+    const raw = readFileSync(join(exGrouped.dir, f), "utf8").trim();
+    return raw ? raw.split("\n").map((l) => JSON.parse(l)) : [];
+  };
+  const groupedTrain = parseJsonl("train.jsonl");
+  const groupedEval = parseJsonl("eval.jsonl");
+  const groupedCal = parseJsonl("calibration.jsonl");
+
+  // Fix 1 verification: "eval-grp-9" has 1 row in eval (d3), 0 rows in train or cal, and held_out_unlabelled >= 1
+  assert.equal(groupedEval.filter((r) => r.group === "eval-grp-9").length, 1);
+  assert.equal(groupedTrain.filter((r) => r.group === "eval-grp-9").length, 0);
+  assert.equal(groupedCal.filter((r) => r.group === "eval-grp-9").length, 0);
+  assert.ok(exGrouped.held_out_unlabelled >= 1, `expected held_out_unlabelled >= 1, got ${exGrouped.held_out_unlabelled}`);
+
+  // Fix 2 verification: both rows of calGroup land in calibration.jsonl, both rows of sharedTrainGroup land in train.jsonl
+  assert.equal(groupedCal.filter((r) => r.group === calGroup).length, 2);
+  assert.equal(groupedTrain.filter((r) => r.group === sharedTrainGroup).length, 2);
+
+  // No group appears in two files across train, eval, and calibration
+  const trainGroupNames = new Set(groupedTrain.map((r) => r.group));
+  const evalGroupNames = new Set(groupedEval.map((r) => r.group));
+  const calGroupNames = new Set(groupedCal.map((r) => r.group));
+  for (const g of evalGroupNames) {
+    assert.ok(!trainGroupNames.has(g) && !calGroupNames.has(g), `eval group ${g} leaked into train/cal`);
+  }
+  for (const g of calGroupNames) {
+    assert.ok(!trainGroupNames.has(g) && !evalGroupNames.has(g), `cal group ${g} leaked into train/eval`);
+  }
+  assert.equal(exGrouped.train_groups, trainGroupNames.size);
+  assert.equal(exGrouped.eval_groups, evalGroupNames.size);
+  assert.equal(exGrouped.calibration_groups, calGroupNames.size);
+
+  // Fix 3 verification: sidecar manifest.json
+  const manifest = JSON.parse(readFileSync(join(exGrouped.dir, "manifest.json"), "utf8"));
+  assert.equal(manifest.schema_version, 1);
+  assert.equal(typeof manifest.exported_at, "string");
+  assert.equal(manifest.eval_fraction, 0.3);
+  assert.equal(manifest.calibration_fraction, 0.2);
+  assert.equal(manifest.split, "sha256(group)[0]/256");
+  assert.equal(manifest.include_teacher, true);
+  assert.equal(manifest.train, groupedTrain.length);
+  assert.equal(manifest.eval, groupedEval.length);
+  assert.equal(manifest.calibration, groupedCal.length);
+  assert.equal(manifest.train_groups, trainGroupNames.size);
+  assert.equal(manifest.eval_groups, evalGroupNames.size);
+  assert.equal(manifest.calibration_groups, calGroupNames.size);
+  assert.equal(manifest.held_out_unlabelled, exGrouped.held_out_unlabelled);
+
+  // Fix 4 & human-over-guard & missing-stays-missing verification
+  const exportedNoTeacher = groupedTrain.find((r) => r.id === noTeacherRow.id);
+  assert.ok(exportedNoTeacher, "noTeacherRow must be in train.jsonl");
+  assert.equal(exportedNoTeacher.teacher_model, null, "teacher_model must be null when no teacher answered");
+  assert.equal(exportedNoTeacher.labels.rows_answer_question, true);
+  assert.equal(exportedNoTeacher.labels.answer_supported, undefined, "missing label must stay undefined, never false");
+
+  const d2AfterHuman = groupedTrain.find((r) => r.id === d2.id);
+  assert.equal(d2AfterHuman.labels.action, "draft_reply", "human label must override guard");
+  assert.equal(d2AfterHuman.label_source.action, "human");
+  assert.equal(d2AfterHuman.labels.priority, "distress", "unlabelled guard question stays guard");
+  assert.equal(d2AfterHuman.label_source.priority, "guard");
+  assert.equal(d2AfterHuman.teacher_labels.action, "alert_operator", "teacher's original answer is still preserved");
+  ok("P2 review fixes verified: pure group-hash split + held_out_unlabelled, calibration_fraction band, manifest.json, teacher_model=null when unanswered, and human-over-guard");
 
   // 20. Real Ollaya contract test mode (runs automatically when OLLAYA_URL or host.docker.internal:11435 is reachable)
   let realOllayaUrl = null;

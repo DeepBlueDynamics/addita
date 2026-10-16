@@ -75,15 +75,21 @@ function guardText(state: unknown, field?: string): string {
 
 function applyGuards(preset: Preset | undefined, state: unknown, questions: Questions, answers: SimpleAnswers) {
   const hits: string[] = [];
-  if (!preset?.guards?.length) return { answers, hits };
+  const overrides: Record<string, string> = {};
+  if (!preset?.guards?.length) return { answers, hits, overrides };
   const t = guardText(state, preset.text_field);
   const out = { ...answers };
   for (const g of preset.guards) {
     if (!new RegExp(g.pattern, g.flags).test(t)) continue;
     hits.push(g.name);
-    for (const [q, v] of Object.entries(g.set)) if (q in questions) out[q] = v;
+    for (const [q, v] of Object.entries(g.set)) {
+      if (q in questions) {
+        out[q] = v;
+        overrides[q] = g.name;
+      }
+    }
   }
-  return { answers: out, hits };
+  return { answers: out, hits, overrides };
 }
 
 function extractNoulScores(questions: Questions, rawAnswers: Record<string, any> | undefined): Record<string, number> {
@@ -288,6 +294,8 @@ export interface DecideInput {
   /** Pull related past traffic from Lume into the context (default on when Lume is available). */
   lume_context?: boolean;
   ref?: string;
+  group?: string;
+  addita?: { ref?: string; group?: string };
 }
 
 /**
@@ -341,6 +349,9 @@ export async function decide(input: DecideInput) {
 
   const id = randomUUID();
   const ts = new Date().toISOString();
+  const ref = input.ref ?? input.addita?.ref ?? null;
+  const rawGroup = input.group ?? input.addita?.group;
+  const group = (typeof rawGroup === "string" && rawGroup.trim()) ? rawGroup.trim() : (ref || id);
   const transcript = lume.transcriptOf(input.state, p?.text_field);
   const meta = lume.metaOf(input.state, p?.text_field);
 
@@ -403,7 +414,8 @@ export async function decide(input: DecideInput) {
   const row: DecisionRow = {
     id,
     ts,
-    ...(input.ref !== undefined ? { ref: input.ref } : {}),
+    ...(ref !== null ? { ref } : {}),
+    group,
     preset,
     state,
     transcript,
@@ -412,14 +424,15 @@ export async function decide(input: DecideInput) {
     student,
     ...(studentError ? { student_error: studentError } : {}),
     teacher_status: wireTeacherState,
-    teacher_model: tOut.teacherModel,
-    teacher_host: tOut.teacherHost,
+    teacher_model: teacher?.model ?? null,
+    teacher_host: teacher?.host ?? null,
     ...(tOut.cloudPending ? { cloud_pending: true } : {}),
     student_ms: studentMs,
     teacher_ms: teacherMs,
     final: g.answers,
     final_source: source,
     guards: g.hits,
+    ...(Object.keys(g.overrides).length ? { guard_overrides: g.overrides } : {}),
   };
   store.addDecision(row);
   if (teacher) store.addTeacher(teacher);
@@ -435,7 +448,7 @@ export async function decide(input: DecideInput) {
   const totalMs = Date.now() - tStart;
   void otlp.emitDecision({
     id,
-    ref: input.ref ?? null,
+    ref,
     preset,
     model: student?.model ?? model,
     teacher_model: tOut.teacherModel,
@@ -455,6 +468,8 @@ export async function decide(input: DecideInput) {
 
   return {
     id,
+    ...(ref !== null ? { ref } : {}),
+    group,
     answers: g.answers,
     source,
     guards: g.hits,
@@ -575,6 +590,8 @@ export async function decideHttp(req: ValidatedDecideRequest | ValidatedV1Reques
   const state = req.state!;
   const id = randomUUID();
   const ts = new Date().toISOString();
+  const ref = req.addita?.ref ?? null;
+  const group = (req.addita?.group && req.addita.group.trim()) ? req.addita.group.trim() : (ref || id);
   const transcript = lume.transcriptOf(state, presetObj?.text_field);
   const meta = lume.metaOf(state, presetObj?.text_field);
 
@@ -641,7 +658,8 @@ export async function decideHttp(req: ValidatedDecideRequest | ValidatedV1Reques
   const row: DecisionRow = {
     id,
     ts,
-    ref: req.addita?.ref ?? null,
+    ref,
+    group,
     preset: presetName,
     state,
     transcript,
@@ -650,14 +668,15 @@ export async function decideHttp(req: ValidatedDecideRequest | ValidatedV1Reques
     student,
     ...(studentError ? { student_error: studentError } : {}),
     teacher_status: teacherState,
-    teacher_model: tOut.teacherModel,
-    teacher_host: tOut.teacherHost,
+    teacher_model: teacher?.model ?? null,
+    teacher_host: teacher?.host ?? null,
     ...(tOut.cloudPending ? { cloud_pending: true } : {}),
     student_ms: studentMs,
     teacher_ms: teacherMs,
     final: g.answers,
     final_source: source,
     guards: g.hits,
+    ...(Object.keys(g.overrides).length ? { guard_overrides: g.overrides } : {}),
   };
   store.addDecision(row);
   if (teacher) store.addTeacher(teacher);
@@ -736,12 +755,13 @@ export async function decideHttp(req: ValidatedDecideRequest | ValidatedV1Reques
     eval_duration: evalDurationNs,
     addita: {
       id,
-      ref: req.addita?.ref ?? null,
+      ref,
+      group,
       final: g.answers,
       source,
       teacher: teacherState,
-      teacher_model: tOut.teacherModel,
-      teacher_host: tOut.teacherHost,
+      teacher_model: teacher?.model ?? null,
+      teacher_host: teacher?.host ?? null,
       ...(tOut.cloudPending ? { cloud_pending: true } : {}),
       guards: g.hits,
       agreement,
@@ -797,19 +817,20 @@ export function getDecision(id: string) {
   }
 
   const updatedAt = row.label?.ts ?? row.teacher?.ts ?? row.ts;
-  const fallbackTeacher = ollama.syncTeacherInfo(config.ollamaModel);
   const cloudPending = row.teacher ? !!row.teacher.cloud_pending : !!row.cloud_pending;
+  const group = (row.group && row.group.trim()) || (row.ref && row.ref.trim()) || row.id;
 
   return {
     id: row.id,
     ref: row.ref ?? null,
+    group,
     created_at: row.ts,
     updated_at: updatedAt,
     final,
     source,
     teacher: teacherState,
-    teacher_model: row.teacher?.model ?? row.teacher_model ?? fallbackTeacher.model,
-    teacher_host: row.teacher?.host ?? row.teacher_host ?? fallbackTeacher.host,
+    teacher_model: row.teacher?.model ?? null,
+    teacher_host: row.teacher?.host ?? null,
     ...(cloudPending ? { cloud_pending: true } : {}),
     guards: row.guards,
     agreement,

@@ -75,6 +75,18 @@ function buildTools(): ToolDef[] {
             type: "string",
             description: "Optional caller correlation id",
           },
+          group: {
+            type: "string",
+            description: "Optional group id for grouped train/eval split (defaults to ref, then decision id)",
+          },
+          addita: {
+            type: "object",
+            properties: {
+              ref: { type: "string" },
+              group: { type: "string" },
+            },
+            description: "Optional metadata block (ref, group)",
+          },
         },
         required: ["state"],
       },
@@ -139,8 +151,9 @@ function buildTools(): ToolDef[] {
       name: "training_export",
       title: "Export dataset",
       description:
-        "Write train.jsonl and eval.jsonl for fine-tuning the decision model. Labels: human first, then teacher; " +
-        "the student never labels itself. eval.jsonl holds only human-labelled rows.",
+        "Write train.jsonl, eval.jsonl, calibration.jsonl, and manifest.json for fine-tuning the decision model. " +
+        "Split is decided by sha256(group)[0]/256: [0, eval_fraction) is eval (human labels only; unlabelled rows dropped as held_out_unlabelled), " +
+        "[eval_fraction, eval_fraction + calibration_fraction) is calibration, and the rest is train (human > guard > teacher).",
       inputSchema: {
         type: "object",
         properties: {
@@ -148,16 +161,26 @@ function buildTools(): ToolDef[] {
             type: "number",
             minimum: 0,
             maximum: 1,
-            description: "Share of human-labelled rows held out (default 0.3)",
+            description: "Share of groups held out for eval (default 0.3; eval_fraction + calibration_fraction must be < 1)",
+          },
+          calibration_fraction: {
+            type: "number",
+            minimum: 0,
+            maximum: 1,
+            description: "Share of groups held out for calibration (default 0; eval_fraction + calibration_fraction must be < 1)",
           },
           include_teacher: {
             type: "boolean",
-            description: "Include teacher-labelled rows in train (default true)",
+            description: "Include teacher-labelled rows in train/calibration (default true)",
           },
         },
       },
-      handler: wrap(({ eval_fraction, include_teacher }: any) =>
-        exportDataset({ evalFraction: eval_fraction, includeTeacher: include_teacher }),
+      handler: wrap(({ eval_fraction, calibration_fraction, include_teacher }: any) =>
+        exportDataset({
+          evalFraction: eval_fraction,
+          calibrationFraction: calibration_fraction,
+          includeTeacher: include_teacher,
+        }),
       ),
     },
     {

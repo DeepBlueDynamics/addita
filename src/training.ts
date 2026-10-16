@@ -1,28 +1,88 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tryLoadLocalPreset } from "./addita.js";
 import { config } from "./config.js";
 import { bucket, studentProbs, valueKey, type SimpleAnswers, type SimpleValue } from "./questions.js";
 import { store, type JoinedRow } from "./store.js";
 
-type LabelSource = "human" | "teacher";
+export type LabelSource = "human" | "teacher" | "guard";
 
-/** Per-question training label: human beats teacher; the student never labels itself. */
-function labelsFor(r: JoinedRow, allowTeacher: boolean) {
+function resolveGroup(r: JoinedRow): string {
+  if (typeof r.group === "string" && r.group.trim()) return r.group.trim();
+  if (typeof r.ref === "string" && r.ref.trim()) return r.ref.trim();
+  return r.id;
+}
+
+/** Resolve which questions on row `r` were forced by a deterministic guard, and to what values. */
+export function guardOverridesFor(r: JoinedRow): {
+  overrides: Record<string, string>;
+  values: SimpleAnswers;
+} {
+  const overrides: Record<string, string> = {};
+  const values: SimpleAnswers = {};
+
+  if (r.guards && r.guards.length > 0) {
+    const presetName = r.preset ?? config.defaultPreset;
+    const preset = presetName ? tryLoadLocalPreset(presetName) : undefined;
+    if (preset?.guards?.length) {
+      const hitSet = new Set(r.guards);
+      for (const g of preset.guards) {
+        if (!hitSet.has(g.name)) continue;
+        for (const [q, v] of Object.entries(g.set)) {
+          if (q in r.questions) {
+            overrides[q] = g.name;
+            values[q] = v;
+          }
+        }
+      }
+    }
+  }
+
+  if (r.guard_overrides && typeof r.guard_overrides === "object") {
+    for (const [q, gName] of Object.entries(r.guard_overrides)) {
+      if (q in r.questions && typeof gName === "string") {
+        overrides[q] = gName;
+        if (values[q] === undefined && r.final?.[q] !== undefined) {
+          values[q] = r.final[q];
+        }
+      }
+    }
+  }
+
+  return { overrides, values };
+}
+
+/**
+ * Per-question training label:
+ * - Human beats guard and teacher (`"human"`).
+ * - When `allowGuard` is true and a guard forced a question's final answer, use the guard's final answer (`"guard"`).
+ * - When `allowTeacher` is true, use the teacher's answer (`"teacher"`).
+ * - A missing label stays missing (never coerced to false).
+ * - The student never labels itself.
+ */
+export function labelsFor(r: JoinedRow, allowTeacher: boolean, allowGuard = allowTeacher) {
   const labels: SimpleAnswers = {};
   const source: Record<string, LabelSource> = {};
+  const guardInfo = allowGuard ? guardOverridesFor(r) : { overrides: {}, values: {} };
+
   for (const q of Object.keys(r.questions)) {
     const h = r.label?.labels[q];
+    const gName = guardInfo.overrides[q];
+    const gVal = guardInfo.values[q];
     const t = r.teacher?.answers[q];
     if (h !== undefined) {
       labels[q] = h;
       source[q] = "human";
+    } else if (allowGuard && gName !== undefined && gVal !== undefined) {
+      labels[q] = gVal;
+      source[q] = "guard";
     } else if (allowTeacher && t !== undefined) {
       labels[q] = t;
       source[q] = "teacher";
     }
   }
-  return { labels, source };
+  return { labels, source, guardOverrides: guardInfo.overrides };
 }
 
 function rate(hit: number, n: number) {
@@ -42,9 +102,24 @@ export function stats() {
     }
   > = {};
   const guards: Record<string, number> = {};
-  const sources: Record<string, number> = {};
+  const sources: Record<string, number> = { human: 0, teacher: 0, guard: 0 };
+  const labelSources: Record<LabelSource, number> = { human: 0, teacher: 0, guard: 0 };
+
   for (const r of rows) {
-    sources[r.final_source] = (sources[r.final_source] ?? 0) + 1;
+    const effectiveRowSource = r.label
+      ? "human"
+      : r.guards.length > 0
+        ? "guard"
+        : r.teacher
+          ? "teacher"
+          : r.final_source;
+    sources[effectiveRowSource] = (sources[effectiveRowSource] ?? 0) + 1;
+
+    const { source: qSources } = labelsFor(r, true, true);
+    for (const s of Object.values(qSources)) {
+      labelSources[s] = (labelSources[s] ?? 0) + 1;
+    }
+
     for (const g of r.guards) guards[g] = (guards[g] ?? 0) + 1;
     const tModel = r.teacher?.model;
     const tEntry = tModel ? (byTeacher[tModel] ??= { decisions: 0, questions: {} }) : undefined;
@@ -84,6 +159,7 @@ export function stats() {
     awaiting_teacher: rows.filter((r) => !r.teacher).length,
     human_labelled: rows.filter((r) => r.label).length,
     final_source: sources,
+    label_source: labelSources,
     guard_hits: guards,
     questions: Object.fromEntries(
       Object.entries(perQ).map(([q, e]) => [
@@ -140,41 +216,180 @@ export function disagreements(limit = 10) {
 // ---------------------------------------------------------------- export
 
 /**
- * Writes train.jsonl and eval.jsonl. Eval holds only human-labelled rows
- * (a deterministic hash split of them), so the score you measure is never
- * graded by the teacher that produced the training labels.
+ * Writes train.jsonl, eval.jsonl, calibration.jsonl, and manifest.json:
+ * 1. Partition by `group` (default chain: group -> ref -> id) BEFORE any per-question label selection.
+ * 2. Hash bucket is decided by `sha256(group)[0] / 256` alone:
+ *    - `[0, evalFraction)` -> eval.jsonl (human-labelled questions only; rows without human labels are dropped and counted as `held_out_unlabelled`).
+ *    - `[evalFraction, evalFraction + calibrationFraction)` -> calibration.jsonl (train label policy and row shape).
+ *    - `[evalFraction + calibrationFraction, 1)` -> train.jsonl (human > guard > teacher precedence, `guard_overrides`, and `teacher_labels`).
+ * 3. `teacher_model` is the teacher that actually answered (`r.teacher?.model ?? null`), never a configured default fallback.
  */
-export function exportDataset(opts: { evalFraction?: number; includeTeacher?: boolean } = {}) {
+export function exportDataset(
+  opts: { evalFraction?: number; calibrationFraction?: number; includeTeacher?: boolean } = {},
+) {
   const evalFraction = opts.evalFraction ?? 0.3;
+  const calibrationFraction = opts.calibrationFraction ?? 0;
   const includeTeacher = opts.includeTeacher ?? true;
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+
+  if (!Number.isFinite(evalFraction) || evalFraction < 0 || evalFraction >= 1) {
+    throw new Error(`eval_fraction must be in [0, 1), got ${evalFraction}`);
+  }
+  if (!Number.isFinite(calibrationFraction) || calibrationFraction < 0 || calibrationFraction >= 1) {
+    throw new Error(`calibration_fraction must be in [0, 1), got ${calibrationFraction}`);
+  }
+  if (evalFraction + calibrationFraction >= 1) {
+    throw new Error(
+      `eval_fraction (${evalFraction}) + calibration_fraction (${calibrationFraction}) must be less than 1`,
+    );
+  }
+
+  const exportedAt = new Date().toISOString();
+  const stamp = exportedAt.replace(/[:.]/g, "-");
   const dir = join(config.dataDir, "exports", stamp);
   mkdirSync(dir, { recursive: true });
 
   const train: string[] = [];
   const evalRows: string[] = [];
-  const counts = { human: 0, teacher_only: 0, skipped: 0 };
+  const calRows: string[] = [];
+  const trainGroupSet = new Set<string>();
+  const evalGroupSet = new Set<string>();
+  const calGroupSet = new Set<string>();
+  const counts = {
+    human: 0,
+    guard: 0,
+    teacher_only: 0,
+    held_out_unlabelled: 0,
+    skipped: 0,
+  };
 
+  // 1. Partition by group BEFORE any per-question label selection
+  const byGroup = new Map<string, JoinedRow[]>();
   for (const r of store.joined()) {
-    const { labels, source } = labelsFor(r, includeTeacher);
-    if (Object.keys(labels).length === 0) {
-      counts.skipped++;
-      continue;
+    const group = resolveGroup(r);
+    let list = byGroup.get(group);
+    if (!list) {
+      list = [];
+      byGroup.set(group, list);
     }
-    const line = JSON.stringify({ id: r.id, state: r.state, questions: r.questions, labels, label_source: source });
-    if (r.label) {
-      counts.human++;
-      const h = createHash("sha256").update(r.id).digest()[0] / 256;
-      (h < evalFraction ? evalRows : train).push(line);
+    list.push(r);
+  }
+
+  // 2. Assign each group to its band by group hash alone, then select labels per band
+  for (const [group, groupRows] of byGroup.entries()) {
+    const h = createHash("sha256").update(group).digest()[0] / 256;
+    const band: "eval" | "calibration" | "train" =
+      h < evalFraction
+        ? "eval"
+        : h < evalFraction + calibrationFraction
+          ? "calibration"
+          : "train";
+
+    if (band === "eval") {
+      for (const r of groupRows) {
+        const humanOnly = labelsFor(r, false, false);
+        if (Object.keys(humanOnly.labels).length === 0) {
+          counts.held_out_unlabelled++;
+          continue;
+        }
+        counts.human++;
+        evalGroupSet.add(group);
+        const evalObj: Record<string, unknown> = {
+          id: r.id,
+          ref: r.ref ?? null,
+          group,
+          created_at: r.ts,
+          ...(r.preset ? { preset: r.preset } : {}),
+          teacher_model: r.teacher?.model ?? null,
+          state: r.state,
+          questions: r.questions,
+          labels: humanOnly.labels,
+          label_source: humanOnly.source,
+        };
+        evalRows.push(JSON.stringify(evalObj));
+      }
     } else {
-      counts.teacher_only++;
-      train.push(line);
+      for (const r of groupRows) {
+        const humanOnly = labelsFor(r, false, false);
+        const trainLabels = labelsFor(r, includeTeacher, includeTeacher);
+        if (Object.keys(trainLabels.labels).length === 0) {
+          counts.skipped++;
+          continue;
+        }
+        const hasHuman = Object.keys(humanOnly.labels).length > 0;
+        const hasGuard = Object.keys(trainLabels.guardOverrides).length > 0;
+        if (hasHuman) {
+          counts.human++;
+        } else {
+          counts.teacher_only++;
+        }
+        if (hasGuard) {
+          counts.guard++;
+        }
+        const rowObj: Record<string, unknown> = {
+          id: r.id,
+          ref: r.ref ?? null,
+          group,
+          created_at: r.ts,
+          ...(r.preset ? { preset: r.preset } : {}),
+          teacher_model: r.teacher?.model ?? null,
+          state: r.state,
+          questions: r.questions,
+          labels: trainLabels.labels,
+          label_source: trainLabels.source,
+          ...(hasGuard ? { guard_overrides: trainLabels.guardOverrides } : {}),
+          ...(r.teacher ? { teacher_labels: r.teacher.answers } : {}),
+        };
+        if (band === "calibration") {
+          calGroupSet.add(group);
+          calRows.push(JSON.stringify(rowObj));
+        } else {
+          trainGroupSet.add(group);
+          train.push(JSON.stringify(rowObj));
+        }
+      }
     }
   }
 
   writeFileSync(join(dir, "train.jsonl"), train.join("\n") + (train.length ? "\n" : ""));
   writeFileSync(join(dir, "eval.jsonl"), evalRows.join("\n") + (evalRows.length ? "\n" : ""));
-  return { dir, train: train.length, eval: evalRows.length, ...counts };
+  writeFileSync(join(dir, "calibration.jsonl"), calRows.join("\n") + (calRows.length ? "\n" : ""));
+
+  const summary = {
+    train: train.length,
+    eval: evalRows.length,
+    calibration: calRows.length,
+    train_groups: trainGroupSet.size,
+    eval_groups: evalGroupSet.size,
+    calibration_groups: calGroupSet.size,
+    groups: {
+      train: trainGroupSet.size,
+      eval: evalGroupSet.size,
+      calibration: calGroupSet.size,
+    },
+    ...counts,
+  };
+
+  const manifest = {
+    schema_version: 1,
+    exported_at: exportedAt,
+    eval_fraction: evalFraction,
+    calibration_fraction: calibrationFraction,
+    split: "sha256(group)[0]/256",
+    include_teacher: includeTeacher,
+    ...summary,
+    counts: {
+      train: train.length,
+      eval: evalRows.length,
+      calibration: calRows.length,
+      ...counts,
+    },
+  };
+  writeFileSync(join(dir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
+
+  return {
+    dir,
+    ...summary,
+  };
 }
 
 // ---------------------------------------------------------------- calibration
@@ -202,7 +417,7 @@ export function fitCalibration(opts: { includeTeacher?: boolean; minSamples?: nu
   const buckets: Record<string, { probs: number[]; y: number }[]> = {};
   for (const r of store.joined()) {
     if (!r.student) continue;
-    const { labels } = labelsFor(r, opts.includeTeacher ?? false);
+    const { labels } = labelsFor(r, opts.includeTeacher ?? false, opts.includeTeacher ?? false);
     for (const [q, v] of Object.entries(labels)) {
       const question = r.questions[q];
       const sp = studentProbs(question, r.student.answers[q]);

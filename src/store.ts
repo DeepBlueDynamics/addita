@@ -14,6 +14,7 @@ export interface DecisionRow {
   id: string;
   ts: string;
   ref?: string | null;
+  group?: string;
   preset?: string;
   /** The state exactly as the models saw it (context included). */
   state: unknown;
@@ -30,8 +31,8 @@ export interface DecisionRow {
   } | null;
   student_error?: string;
   teacher_status?: "answered" | "pending" | "skipped" | "failed";
-  teacher_model?: string;
-  teacher_host?: string;
+  teacher_model?: string | null;
+  teacher_host?: string | null;
   /** True when local teacher answered because the primary cloud teacher failed; backfill will re-ask cloud. */
   cloud_pending?: boolean;
   student_ms?: number;
@@ -39,6 +40,8 @@ export interface DecisionRow {
   final: SimpleAnswers;
   final_source: "teacher" | "student" | "guard" | "none";
   guards: string[];
+  /** Map of question id -> guard name for questions whose final answer was forced by a guard. */
+  guard_overrides?: Record<string, string>;
 }
 
 export interface TeacherRow {
