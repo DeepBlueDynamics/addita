@@ -36,6 +36,8 @@ Addita was built for boats: a Pi on the nav station, a GPU box somewhere else on
 
 ## How it works
 
+The diagram shows the target architecture. The HTTP API, the `addita` response block and OTLP logging are in progress; see [Status](#status).
+
 ```mermaid
 flowchart LR
     C[Caller<br/>Lume, agents, MCP] -->|/api/decide| A[Addita]
@@ -172,7 +174,7 @@ A preset is a JSON file in `presets/` holding `questions` (TypeSafe format), an 
 
 ## Lume
 
-Addita logs to [Lume](https://github.com/DeepBlueDynamics/lume) so every decision is searchable and every metric is queryable with SQL. Lume can also call Addita *(in progress on both sides)*, for example to judge whether the SQL its agent wrote actually answered the question, and reuse the good ones as worked examples.
+Addita logs to [Lume](https://github.com/DeepBlueDynamics/lume) so every decision is searchable. Today that is the CLI integration below, with metrics from `training_stats`. Metrics queryable with SQL arrive with OTLP logging *(in progress)*. Lume can also call Addita *(in progress on both sides)*, for example to judge whether the SQL its agent wrote actually answered the question, and reuse the good ones as worked examples.
 
 Today Addita writes each decision as a Markdown file and indexes it with the `lume` CLI. For dense vectors, index with Shivvr:
 
@@ -187,7 +189,7 @@ This assumes a running Shivvr (default `http://localhost:8085`).
 
 ## The training loop
 
-1. **Run with the teacher on.** Use the stack normally; every call becomes a row.
+1. **Run with the teacher on.** Use the stack normally; every successful call becomes a row.
 2. **Label the disagreements.** `training_disagreements` → `comms_label`. A few minutes a day covers it.
 3. **Watch `training_stats`.** When `student_accuracy_vs_human` matches `teacher_accuracy_vs_human` on a question, the student can own that question.
 4. **Calibrate.** `training_calibrate` fits a temperature per bucket from human labels (about 30 per bucket). Add `create_model` to bake it into a new Ollaya model.
