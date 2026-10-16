@@ -22,6 +22,15 @@ function bool(name: string): boolean | undefined {
 export type TeacherMode = "auto" | "off" | "always";
 
 export const config = {
+  /** HTTP server host (bound to 0.0.0.0 by default so containers are reachable). */
+  host: env.ADDITA_HOST ?? "0.0.0.0",
+  /** HTTP server port (11345 by default). */
+  port: num("ADDITA_PORT", 11345),
+  /** Optional path to Bearer token file for HTTP endpoints. */
+  tokenFile: env.ADDITA_TOKEN_FILE || undefined,
+  /** Path to serve.json discovery file. */
+  serveJson: resolve(env.ADDITA_SERVE_JSON ?? join(env.ADDITA_DATA_DIR ?? join(homedir(), ".addita"), "serve.json")),
+
   /** Ollaya daemon (the student / decision model). */
   ollayaUrl: (env.OLLAYA_URL ?? "http://127.0.0.1:11435").replace(/\/+$/, ""),
   ollayaApiKey: env.OLLAYA_API_KEY || undefined,
@@ -30,9 +39,12 @@ export const config = {
 
   /** Ollama daemon (the teacher LLM, also proxied). */
   ollamaUrl: (env.OLLAMA_URL ?? "http://127.0.0.1:11434").replace(/\/+$/, ""),
-  ollamaModel: env.OLLAMA_MODEL ?? "qwen3:8b",
+  /** Primary (cloud by default) teacher model. */
+  ollamaModel: env.OLLAMA_MODEL ?? "deepseek-v4.1-flash:cloud",
+  /** Local fallback teacher model used when cloud is disallowed or fails. */
+  ollamaLocalModel: env.OLLAMA_LOCAL_MODEL !== undefined ? env.OLLAMA_LOCAL_MODEL : "qwen3.5:4b",
   ollamaTimeoutMs: num("OLLAMA_TIMEOUT_MS", 120_000),
-  /** Pass `think` to Ollama only when set; some models reject the field. */
+  /** Pass `think` to Ollama only when set; teacher calls default to think:false so reasoning models don't stall or break JSON schema. */
   ollamaThink: bool("OLLAMA_THINK"),
   /** How long an online/offline probe result is trusted. */
   ollamaProbeTtlMs: num("OLLAMA_PROBE_TTL_MS", 10_000),
@@ -46,6 +58,8 @@ export const config = {
   teacherMode: (env.ADDITA_TEACHER ?? "auto") as TeacherMode,
   /** When true the teacher is shown the student's answers (biases labels; off by default). */
   teacherSeesStudent: bool("ADDITA_TEACHER_SEES_STUDENT") ?? false,
+  /** Whether a cloud or non-local Ollama teacher is allowed (default true / 1). */
+  allowCloudTeacher: bool("ADDITA_ALLOW_CLOUD_TEACHER") ?? true,
 
   dataDir: resolve(env.ADDITA_DATA_DIR ?? join(homedir(), ".addita")),
   presetsDir: resolve(env.ADDITA_PRESETS_DIR ?? join(here, "..", "presets")),
@@ -69,6 +83,8 @@ export const config = {
     contextHits: num("LUME_CONTEXT_HITS", 3),
     contextHours: num("LUME_CONTEXT_HOURS", 24),
     timeoutMs: num("LUME_TIMEOUT_MS", 60_000),
+    /** Path to ~/.lume/serve.json for OTLP discovery. */
+    serveJson: resolve(env.LUME_SERVE_JSON ?? join(homedir(), ".lume", "serve.json")),
   },
 };
 

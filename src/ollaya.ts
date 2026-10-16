@@ -2,10 +2,15 @@ import { config } from "./config.js";
 import { requestJson } from "./http.js";
 import type { Questions } from "./questions.js";
 
-const headers = (): Record<string, string> =>
+export interface CalibrationSpec {
+  temperature_by_options?: Record<string, number>;
+  noul_threshold?: number;
+}
+
+export const headers = (): Record<string, string> =>
   config.ollayaApiKey ? { authorization: `Bearer ${config.ollayaApiKey}` } : {};
 
-const url = (p: string) => `${config.ollayaUrl}${p}`;
+export const url = (p: string) => `${config.ollayaUrl}${p}`;
 
 export interface DecideResponse {
   model: string;
@@ -13,13 +18,55 @@ export interface DecideResponse {
   usage?: { input_tokens: number; output_tokens: number };
   routing?: unknown;
   state_truncated?: boolean;
+  done_reason?: string;
+  created_at?: string;
   total_duration?: number;
+  load_duration?: number;
+  eval_duration?: number;
+}
+
+export interface DecideExtraOpts {
+  keepAlive?: string | number;
+  images?: string[];
+  extras?: string[];
 }
 
 /** POST /api/decide (native endpoint: adds routing, timings, state_truncated). */
-export function decide(model: string, state: unknown, questions: Questions, keepAlive?: string | number) {
+export function decide(
+  model: string,
+  state: unknown,
+  questions?: Questions,
+  keepAliveOrOpts?: string | number | DecideExtraOpts,
+) {
+  const opts: DecideExtraOpts =
+    typeof keepAliveOrOpts === "object" && keepAliveOrOpts !== null
+      ? keepAliveOrOpts
+      : { keepAlive: keepAliveOrOpts };
   return requestJson<DecideResponse>(url("/api/decide"), {
-    body: { model, state, questions, ...(keepAlive !== undefined ? { keep_alive: keepAlive } : {}) },
+    body: {
+      model,
+      ...(state !== undefined ? { state } : {}),
+      ...(questions !== undefined ? { questions } : {}),
+      ...(opts.images?.length ? { images: opts.images } : {}),
+      ...(opts.keepAlive !== undefined ? { keep_alive: opts.keepAlive } : {}),
+      ...(opts.extras?.length ? { extras: opts.extras } : {}),
+    },
+    headers: headers(),
+    timeoutMs: config.ollayaTimeoutMs,
+  });
+}
+
+export function show(model: string, verbose = false) {
+  return requestJson<any>(url("/api/show"), {
+    body: { model, verbose },
+    headers: headers(),
+    timeoutMs: config.ollayaTimeoutMs,
+  });
+}
+
+export function presetShow(name: string) {
+  return requestJson<any>(url("/api/presets/show"), {
+    body: { name },
     headers: headers(),
     timeoutMs: config.ollayaTimeoutMs,
   });

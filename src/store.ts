@@ -13,6 +13,7 @@ import type { Questions, SimpleAnswers } from "./questions.js";
 export interface DecisionRow {
   id: string;
   ts: string;
+  ref?: string | null;
   preset?: string;
   /** The state exactly as the models saw it (context included). */
   state: unknown;
@@ -28,8 +29,11 @@ export interface DecisionRow {
     latency_ms: number;
   } | null;
   student_error?: string;
+  teacher_status?: "answered" | "pending" | "skipped" | "failed";
+  teacher_model?: string;
+  teacher_host?: string;
   final: SimpleAnswers;
-  final_source: "teacher" | "student" | "guard";
+  final_source: "teacher" | "student" | "guard" | "none";
   guards: string[];
 }
 
@@ -37,6 +41,7 @@ export interface TeacherRow {
   id: string;
   ts: string;
   model: string;
+  host?: string;
   answers: SimpleAnswers;
   reasons: Record<string, string>;
   latency_ms: number;

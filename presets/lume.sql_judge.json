@@ -1,0 +1,21 @@
+{
+  "description": "Judge whether a SQL query's rows answer the user's question and whether the written answer is faithful to those rows.",
+  "questions": {
+    "rows_answer_question": {
+      "type": "noul",
+      "instructions": "Given state.question, state.sql, and state.rows, do the returned rows actually answer the user's question (right metric, right filter, right time window, non-empty when data is expected)?",
+      "criteria": {
+        "true": "The SQL and its returned rows directly answer what the user asked.",
+        "false": "The rows are empty when they shouldn't be, answer a different question, or miss a requested filter or column."
+      }
+    },
+    "answer_supported": {
+      "type": "noul",
+      "instructions": "If state.answer is present, is every number and claim in state.answer supported by state.rows without contradiction or invention? (If state.answer is null or absent, judge whether state.rows alone are sufficient to state an answer.)",
+      "criteria": {
+        "true": "Every figure and claim in the answer is grounded in state.rows.",
+        "false": "The answer invents numbers, contradicts state.rows, or claims something the rows do not show."
+      }
+    }
+  }
+}

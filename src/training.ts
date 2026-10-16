@@ -34,11 +34,22 @@ function rate(hit: number, n: number) {
 export function stats() {
   const rows = store.joined();
   const perQ: Record<string, { student_vs_teacher: [number, number]; student_vs_human: [number, number]; teacher_vs_human: [number, number] }> = {};
+  const byTeacher: Record<
+    string,
+    {
+      decisions: number;
+      questions: Record<string, { student_vs_teacher: [number, number]; teacher_vs_human: [number, number] }>;
+    }
+  > = {};
   const guards: Record<string, number> = {};
   const sources: Record<string, number> = {};
   for (const r of rows) {
     sources[r.final_source] = (sources[r.final_source] ?? 0) + 1;
     for (const g of r.guards) guards[g] = (guards[g] ?? 0) + 1;
+    const tModel = r.teacher?.model;
+    const tEntry = tModel ? (byTeacher[tModel] ??= { decisions: 0, questions: {} }) : undefined;
+    if (tEntry) tEntry.decisions++;
+
     for (const q of Object.keys(r.questions)) {
       const s = r.student?.simple[q];
       const t = r.teacher?.answers[q];
@@ -52,6 +63,18 @@ export function stats() {
       cmp(s, t, "student_vs_teacher");
       cmp(s, h, "student_vs_human");
       cmp(t, h, "teacher_vs_human");
+
+      if (tEntry) {
+        const te = (tEntry.questions[q] ??= { student_vs_teacher: [0, 0], teacher_vs_human: [0, 0] });
+        if (s !== undefined && t !== undefined) {
+          te.student_vs_teacher[1]++;
+          if (s === t) te.student_vs_teacher[0]++;
+        }
+        if (t !== undefined && h !== undefined) {
+          te.teacher_vs_human[1]++;
+          if (t === h) te.teacher_vs_human[0]++;
+        }
+      }
     }
   }
   return {
@@ -70,6 +93,24 @@ export function stats() {
           student_accuracy_vs_human: rate(...e.student_vs_human),
           teacher_accuracy_vs_human: rate(...e.teacher_vs_human),
           n: { teacher: e.student_vs_teacher[1], human: e.student_vs_human[1] },
+        },
+      ]),
+    ),
+    by_teacher: Object.fromEntries(
+      Object.entries(byTeacher).map(([model, t]) => [
+        model,
+        {
+          decisions: t.decisions,
+          questions: Object.fromEntries(
+            Object.entries(t.questions).map(([q, e]) => [
+              q,
+              {
+                student_agrees_with_teacher: rate(...e.student_vs_teacher),
+                teacher_accuracy_vs_human: rate(...e.teacher_vs_human),
+                n: { teacher: e.student_vs_teacher[1], human: e.teacher_vs_human[1] },
+              },
+            ]),
+          ),
         },
       ]),
     ),
