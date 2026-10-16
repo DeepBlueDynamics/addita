@@ -26,6 +26,8 @@ export const config = {
   host: env.ADDITA_HOST ?? "0.0.0.0",
   /** HTTP server port (11345 by default). */
   port: num("ADDITA_PORT", 11345),
+  /** Start the MCP stdio transport and exit on stdin EOF (default true; set false for HTTP-only / Docker). */
+  stdio: bool("ADDITA_STDIO") ?? true,
   /** Optional path to Bearer token file for HTTP endpoints. */
   tokenFile: env.ADDITA_TOKEN_FILE || undefined,
   /** Path to serve.json discovery file. */

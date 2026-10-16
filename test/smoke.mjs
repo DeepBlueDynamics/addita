@@ -855,6 +855,48 @@ try {
   assert.equal(d2AfterHuman.teacher_labels.action, "alert_operator", "teacher's original answer is still preserved");
   ok("P2 review fixes verified: pure group-hash split + held_out_unlabelled, calibration_fraction band, manifest.json, teacher_model=null when unanswered, and human-over-guard");
 
+  // 19c. P3 HTTP-only mode (ADDITA_STDIO=false with stdin closed </dev/null): stays alive and serves /health + /mcp after 2 s
+  const noStdioPort = 21348;
+  const noStdioDir = mkdtempSync(join(tmpdir(), "addita-nostdio-"));
+  const noStdioChild = spawn(process.execPath, ["dist/index.js"], {
+    env: {
+      ...process.env,
+      ADDITA_HOST: "127.0.0.1",
+      ADDITA_PORT: String(noStdioPort),
+      ADDITA_STDIO: "false",
+      ADDITA_LUME: "off",
+      OLLAYA_URL: `http://127.0.0.1:${OLLAYA_PORT}`,
+      OLLAMA_URL: `http://127.0.0.1:${OLLAMA_PORT}`,
+      ADDITA_DATA_DIR: noStdioDir,
+      LUME_SERVE_JSON: lumeServeJson,
+    },
+    stdio: ["ignore", "pipe", "pipe"], // stdin attached to /dev/null (immediate EOF)
+  });
+  try {
+    await new Promise((r) => setTimeout(r, 2100));
+    assert.equal(noStdioChild.exitCode, null, "ADDITA_STDIO=false must not exit when stdin is /dev/null");
+    const nsHealth = await fetch(`http://127.0.0.1:${noStdioPort}/health`);
+    assert.equal(nsHealth.status, 200);
+    const nsHealthData = await nsHealth.json();
+    assert.equal(nsHealthData.service, "addita");
+    assert.equal(nsHealthData.ready, true);
+
+    const nsMcp = await fetch(`http://127.0.0.1:${noStdioPort}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
+    });
+    assert.equal(nsMcp.status, 200);
+    ok("ADDITA_STDIO=false with stdin closed (</dev/null): still serving /health and /mcp after 2 s");
+  } finally {
+    await new Promise((r) => {
+      if (noStdioChild.exitCode !== null) return r();
+      noStdioChild.once("exit", r);
+      noStdioChild.kill("SIGTERM");
+    });
+    rmSync(noStdioDir, { recursive: true, force: true });
+  }
+
   // 20. Real Ollaya contract test mode (runs automatically when OLLAYA_URL or host.docker.internal:11435 is reachable)
   let realOllayaUrl = null;
   for (const cand of [process.env.OLLAYA_URL, "http://host.docker.internal:11435", "http://127.0.0.1:11435"].filter(Boolean)) {

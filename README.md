@@ -95,6 +95,16 @@ args = ["/path/to/addita/dist/index.js"]
 env = { OLLAMA_URL = "http://gpu-box:11434", OLLAMA_MODEL = "qwen3.5:4b" }
 ```
 
+### Docker
+
+```sh
+docker build -t addita .
+docker run -d --name addita -p 11345:11345 -v addita-data:/data \
+  -e OLLAYA_URL=http://<ollaya-host>:11435 -e OLLAMA_URL=http://<ollama-host>:11434 addita
+```
+
+The image runs HTTP and `/mcp` only (`ADDITA_STDIO=false`), as a non-root user, with data in `/data` and a health check on `/health`.
+
 ## HTTP API
 
 ```sh
@@ -102,7 +112,7 @@ OLLAYA_URL=http://localhost:11435 OLLAMA_URL=http://localhost:11434 node dist/in
 curl localhost:11345/health   # {"service":"addita","version":"0.1.0","ready":true,"ollaya":true,"ollama":true}
 ```
 
-Addita listens on `0.0.0.0:11345` (set `ADDITA_PORT` explicitly; if it's unset and the port is busy, Addita picks a free one) and serves the [Ollaya API](https://github.com/ollaya-dev/ollaya/blob/main/docs/api.md). It also serves MCP over stdio, and writes its address to `~/.addita/serve.json` so local callers can find it. `POST /api/decide`, `/v1/systemone` and `/v1/decisions` run the student/teacher/guard loop. Every other endpoint (`/api/tags`, `/api/show`, `/api/pull`, `/api/create`, …) is forwarded to Ollaya unchanged. MCP is served over streamable HTTP at `/mcp`.
+Addita listens on `0.0.0.0:11345` (set `ADDITA_PORT` explicitly; if it's unset and the port is busy, Addita picks a free one) and serves the [Ollaya API](https://github.com/ollaya-dev/ollaya/blob/main/docs/api.md). It also serves MCP over stdio (turn that off with `ADDITA_STDIO=false`), and writes its address to `~/.addita/serve.json` so local callers can find it. `POST /api/decide`, `/v1/systemone` and `/v1/decisions` run the student/teacher/guard loop. Every other endpoint (`/api/tags`, `/api/show`, `/api/pull`, `/api/create`, …) is forwarded to Ollaya unchanged. MCP is served over streamable HTTP at `/mcp`.
 
 A request is a plain Ollaya decide, plus an optional `addita` block:
 
@@ -235,6 +245,7 @@ This assumes a running Shivvr (default `http://localhost:8085`).
 | `ADDITA_TEACHER_SEES_STUDENT` | `0` | `1` lets the teacher correct the student instead of answering blind |
 | `ADDITA_HOST` | `0.0.0.0` | HTTP bind address |
 | `ADDITA_PORT` | `11345` | HTTP port; set it explicitly to stop Addita from falling back to a free port |
+| `ADDITA_STDIO` | `true` | Also serve MCP on stdin/stdout, and exit when stdin closes. The Docker image sets it to `false` (HTTP and `/mcp` only). |
 | `ADDITA_TOKEN_FILE` | unset | If set, requests need `Authorization: Bearer <token from this file>` |
 | `ADDITA_SERVE_JSON` | `$ADDITA_DATA_DIR/serve.json` | Discovery file (`~/.addita/serve.json` by default) |
 | `ADDITA_DATA_DIR` | `~/.addita` | `decisions.jsonl`, `teacher.jsonl`, `labels.jsonl`, `exports/` |

@@ -21,18 +21,27 @@ if (config.port >= 0) {
   }
 }
 
+for (const sig of ["SIGTERM", "SIGINT"] as const) {
+  process.once(sig, () => {
+    httpServer?.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1000).unref();
+  });
+}
+
 console.error(
-  `addita: http ${config.host}:${httpPort}, ollaya ${config.ollayaUrl}, ollama ${config.ollamaUrl} (${config.ollamaModel}), data ${config.dataDir}`,
+  `addita: http ${config.host}:${httpPort}, stdio ${config.stdio ? "on" : "off"}, ollaya ${config.ollayaUrl}, ollama ${config.ollamaUrl} (${config.ollamaModel}), data ${config.dataDir}`,
 );
 
-// Load and connect the MCP stdio server asynchronously after the HTTP listener is already open.
-void preloadMcpModule()
-  .then((mcp) =>
-    mcp.startStdioMcpServer(() => {
-      httpServer?.close();
-      process.exit(0);
-    }),
-  )
-  .catch((e: any) => {
-    console.error(`addita: mcp startup error: ${e?.message ?? e}`);
-  });
+if (config.stdio) {
+  // Load and connect the MCP stdio server asynchronously after the HTTP listener is already open.
+  void preloadMcpModule()
+    .then((mcp) =>
+      mcp.startStdioMcpServer(() => {
+        httpServer?.close();
+        process.exit(0);
+      }),
+    )
+    .catch((e: any) => {
+      console.error(`addita: mcp startup error: ${e?.message ?? e}`);
+    });
+}
