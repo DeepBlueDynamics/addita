@@ -7,7 +7,7 @@
 [![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen.svg)](package.json)
 [![MCP](https://img.shields.io/badge/MCP-server-purple.svg)](#mcp-tools)
-[![Ollaya API](https://img.shields.io/badge/Ollaya%20API-in%20progress-orange.svg)](#http-api)
+[![Ollaya API](https://img.shields.io/badge/Ollaya-API%20compatible-orange.svg)](#http-api)
 
 [How it works](#how-it-works) · [Quick start](#quick-start) · [HTTP API](#http-api) · [MCP tools](#mcp-tools) · [Training loop](#the-training-loop) · [Configuration](#configuration)
 
@@ -17,26 +17,25 @@
 
 Small decision models are fast, cheap and run anywhere, including a Raspberry Pi with no network. They are also only as good as the labels they were trained on. Large LLMs make good labels, but they are slow, sometimes offline, and sometimes in the cloud.
 
-Addita puts the two together. It is built to sit where [Ollaya](https://github.com/ollaya-dev/ollaya) sits and speak Ollaya's API, so a caller can point at it with no change to the requests it sends *(in progress; today Addita runs as an MCP server)*. Every decision is answered by the small model (the **student**). When an [Ollama](https://ollama.com) model (the **teacher**) is reachable, it answers the same typed questions, and both answers are saved as a training pair. Deterministic **guards** override both for rules that must never depend on a model. Over time your own corrections show when the student is good enough to stand alone.
+Addita puts the two together. It sits where [Ollaya](https://github.com/ollaya-dev/ollaya) sits and speaks Ollaya's API, so a caller can point at it with no change to the requests it sends. Every decision is answered by the small model (the **student**). When an [Ollama](https://ollama.com) model (the **teacher**) is reachable, it answers the same typed questions, and both answers are saved as a training pair. Deterministic **guards** override both for rules that must never depend on a model. Over time your own corrections show when the student is good enough to stand alone.
 
 ### Built for places where the network is optional
 
-Addita was built for boats: a Pi on the nav station, a GPU box somewhere else on the LAN, and a satellite link that comes and goes. When the teacher is offline, the student still answers, guards still apply, and the decision is still stored. Only the teacher's half of the training row waits, and `training_backfill` fills it in when the teacher returns. (A call made with `teacher: require` fails while the teacher is offline. Keeping guards and logging running when *both* models are down is in progress.)
+Addita was built for boats: a Pi on the nav station, a GPU box somewhere else on the LAN, and a satellite link that comes and goes. When the teacher is offline, the student still answers, guards still apply, and the decision is still stored. Only the teacher's half of the training row waits, and `training_backfill` fills it in when the teacher returns. Over HTTP, guards and logging keep running even when *both* models are down. (An MCP call made with `teacher: require` still fails before guards and logging while the teacher is offline; that fix is deferred.)
 
 ## Highlights
 
-- **Ollaya-compatible** *(in progress; see [Status](#status))*. Same endpoints, same request and response shapes. Addita handles decisions itself and forwards everything else to Ollaya.
+- **Ollaya-compatible.** Same endpoints, same request and response shapes, and the same error codes. Addita handles decisions itself and forwards everything else to Ollaya. Tested against a live Ollaya 0.7.2.
+- **Cloud or local teacher.** A cloud teacher by default, with a local model answering whenever the cloud doesn't. `ADDITA_NO_CLOUD=1` keeps everything on the machine.
 - **Student and teacher on every call.** The teacher answers blind by default, so it can't anchor on the student.
 - **Guards win.** Regex rules force answers for safety-critical cases (MAYDAY → `distress`, `alert_operator`). Guards read the preset's text field (e.g. `transcript`), not context retrieved from Lume. Guard outputs are logged with the decision but never used as training labels.
 - **Nothing acts on its own.** Addita labels and recommends. A person approves anything that matters.
 - **Training data as you go.** Every successful call is a row. Label the disagreements, watch agreement climb, then calibrate or fine-tune.
-- **Any decision, not one domain.** Questions are typed (`noul`, `choice`, `score`) and live in presets. Marine VHF comms ships as the example; a Lume SQL-judging preset is in progress.
-- **Logs to [Lume](https://github.com/DeepBlueDynamics/lume).** Every decision becomes searchable, filterable analytics. *(OTLP logging in progress.)*
+- **Any decision, not one domain.** Questions are typed (`noul`, `choice`, `score`) and live in presets. Marine VHF comms and Lume SQL judging (`lume.sql_judge`) ship as examples.
+- **Logs to [Lume](https://github.com/DeepBlueDynamics/lume).** Every decision becomes searchable, filterable analytics, over the Lume CLI and OTLP.
 - **Local by default.** Data lives in plain JSONL under `~/.addita`.
 
 ## How it works
-
-The diagram shows the target architecture. The HTTP API, the `addita` response block and OTLP logging are in progress; see [Status](#status).
 
 ```mermaid
 flowchart LR
@@ -98,9 +97,12 @@ env = { OLLAMA_URL = "http://gpu-box:11434", OLLAMA_MODEL = "qwen3.5:4b" }
 
 ## HTTP API
 
-> **In progress.** This section describes the target. Today Addita runs as an MCP server over stdio.
+```sh
+OLLAYA_URL=http://localhost:11435 OLLAMA_URL=http://localhost:11434 node dist/index.js
+curl localhost:11345/health   # {"service":"addita","version":"0.1.0","ready":true,"ollaya":true,"ollama":true}
+```
 
-Addita listens on port **11345** and serves the [Ollaya API](https://github.com/ollaya-dev/ollaya/blob/main/docs/api.md). `POST /api/decide`, `/v1/systemone` and `/v1/decisions` run the student/teacher/guard loop. Every other endpoint (`/api/tags`, `/api/show`, `/api/pull`, `/api/create`, …) is forwarded to Ollaya unchanged. MCP is served over streamable HTTP at `/mcp`.
+Addita listens on `0.0.0.0:11345` (set `ADDITA_PORT` explicitly; if it's unset and the port is busy, Addita picks a free one) and serves the [Ollaya API](https://github.com/ollaya-dev/ollaya/blob/main/docs/api.md). It also serves MCP over stdio, and writes its address to `~/.addita/serve.json` so local callers can find it. `POST /api/decide`, `/v1/systemone` and `/v1/decisions` run the student/teacher/guard loop. Every other endpoint (`/api/tags`, `/api/show`, `/api/pull`, `/api/create`, …) is forwarded to Ollaya unchanged. MCP is served over streamable HTTP at `/mcp`.
 
 A request is a plain Ollaya decide, plus an optional `addita` block:
 
@@ -112,7 +114,7 @@ A request is a plain Ollaya decide, plus an optional `addita` block:
     "rows_answer_question": { "type": "noul", "criteria": { "true": "The rows contain what the question asks", "false": "They don't" } },
     "answer_supported": { "type": "noul", "criteria": { "true": "Every claim in the answer is backed by the rows", "false": "Some claim isn't" } }
   },
-  "addita": { "ref": "lume-run-7c1e…", "allow_cloud_teacher": false }
+  "addita": { "ref": "lume-run-7c1e…" }
 }
 ```
 
@@ -140,7 +142,10 @@ The response is Ollaya's native decide response, with the student's typed answer
 
 - `answers` is always the student's real output. Addita never invents probabilities for teacher or guard answers.
 - `final` is the effective decision, with the teacher and guards applied. Read this one. A caller that reads only `answers` gets the student's view, not Addita's decision: the shapes are compatible, but the decisions can differ.
-- `teacher` is `answered`, `pending` (offline, waiting for backfill), `skipped` or `failed`.
+- `teacher` is `answered`, `pending` (offline, waiting for backfill), `skipped` or `failed`. `teacher_model` and `teacher_host` name the teacher that actually answered, and `student_ms` / `teacher_ms` give the time for each.
+- `ref` is echoed from the request, and carried on Addita's OTLP records.
+- `GET /api/addita/decision/{id}` returns a decision's current state. `POST /api/addita/label` with `{id, labels}` records a correction.
+- Errors use Ollaya's shape and codes: `{"error": "…", "code": "INVALID_REQUEST"}`.
 
 ## MCP tools
 
@@ -176,7 +181,9 @@ A preset is a JSON file in `presets/` holding `questions` (TypeSafe format), an 
 
 Addita logs to [Lume](https://github.com/DeepBlueDynamics/lume) so every decision is searchable. Today that is the CLI integration below, with metrics from `training_stats`. Metrics queryable with SQL arrive with OTLP logging *(in progress)*. Lume can also call Addita *(in progress on both sides)*, for example to judge whether the SQL its agent wrote actually answered the question, and reuse the good ones as worked examples.
 
-Today Addita writes each decision as a Markdown file and indexes it with the `lume` CLI. For dense vectors, index with Shivvr:
+Addita sends OTLP logs (`addita.decision`, `addita.decision.final`, `addita.label`) and metrics (`addita.decide.ms`, `addita.decide.count`, `addita.teacher.ms`, `addita.agreement`) to `lume serve --otlp`. It finds Lume through `~/.lume/serve.json`. This is fire-and-forget: if Lume isn't there, decisions carry on. *(Tested against a mock collector; not yet against a live `lume serve`.)*
+
+It also writes each decision as a Markdown file and indexes it with the `lume` CLI. For dense vectors, index with Shivvr:
 
 ```sh
 # set in the MCP server's env, or export before starting the MCP host
@@ -184,8 +191,6 @@ export LUME_INDEX_ARGS="--embed-model embeddinggemma-2 --embed-dimensions 256"
 ```
 
 This assumes a running Shivvr (default `http://localhost:8085`).
-
-*In progress:* OTLP/HTTP logging to `lume serve --otlp` (`/v1/logs`, `/v1/metrics`), discovered through `~/.lume/serve.json`.
 
 ## The training loop
 
@@ -202,7 +207,7 @@ This assumes a running Shivvr (default `http://localhost:8085`).
 - **Guards are forced answers, not labels.** Their outputs are logged but never used as training labels. Keep safety-critical rules in guards rather than trusting either model with them.
 - **Guards read one field.** They read the preset's `text_field`. If that field is missing or isn't a string, they currently scan the whole input JSON, including any context you passed in. Tightening this is in progress.
 - **Context is part of the training row.** The state the models saw is what's stored, so a fine-tuned model learns to use context the way it gets it at run time.
-- **Cloud teachers see your data.** If `OLLAMA_MODEL` is a cloud model, transcripts and query results leave the machine. Use a local teacher for private data.
+- **Cloud teachers see your data.** The default teacher is a cloud model, so transcripts and query results leave the machine. Set `ADDITA_NO_CLOUD=1` to keep everything local, backfill included.
 
 ## Configuration
 
@@ -213,12 +218,18 @@ This assumes a running Shivvr (default `http://localhost:8085`).
 | `OLLAYA_MODEL` | `laya` | Used when the preset names no model |
 | `OLLAYA_TIMEOUT_MS` | `30000` | |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | |
-| `OLLAMA_MODEL` | `qwen3:8b` | Teacher; any model that handles JSON-schema `format` well |
-| `OLLAMA_THINK` | unset | `0`/`1`: passes `think` to Ollama |
+| `OLLAMA_MODEL` | `deepseek-v4.1-flash:cloud` | Teacher; any model that handles JSON-schema `format` well |
+| `OLLAMA_LOCAL_MODEL` | `qwen3.5:4b` | Local teacher, used when the cloud fails or `ADDITA_NO_CLOUD=1` |
+| `ADDITA_NO_CLOUD` | `0` | `1`: never send anything to a cloud teacher, including backfill |
+| `OLLAMA_THINK` | unset | `0`/`1`: sets `think` on teacher calls. Unset sends `think: false`, which keeps teachers fast and their JSON valid |
 | `OLLAMA_TIMEOUT_MS` | `120000` | |
 | `OLLAMA_PROBE_TTL_MS` | `10000` | How long an online/offline check is cached |
 | `ADDITA_TEACHER` | `auto` | `auto`, `off` or `always` |
 | `ADDITA_TEACHER_SEES_STUDENT` | `0` | `1` lets the teacher correct the student instead of answering blind |
+| `ADDITA_HOST` | `0.0.0.0` | HTTP bind address |
+| `ADDITA_PORT` | `11345` | HTTP port; set it explicitly to stop Addita from falling back to a free port |
+| `ADDITA_TOKEN_FILE` | unset | If set, requests need `Authorization: Bearer <token from this file>` |
+| `ADDITA_SERVE_JSON` | `$ADDITA_DATA_DIR/serve.json` | Discovery file (`~/.addita/serve.json` by default) |
 | `ADDITA_DATA_DIR` | `~/.addita` | `decisions.jsonl`, `teacher.jsonl`, `labels.jsonl`, `exports/` |
 | `ADDITA_PRESETS_DIR` | `<package>/presets` | |
 | `ADDITA_PRESET` | `comms` | |
@@ -228,6 +239,7 @@ This assumes a running Shivvr (default `http://localhost:8085`).
 | `LUME_DB` | `$ADDITA_DATA_DIR/lume-db` | |
 | `LUME_TAG_DICT` | `<package>/presets/callsigns.csv` | Entity dictionary for Lume's graph |
 | `LUME_TIMEOUT_MS` | `60000` | |
+| `LUME_SERVE_JSON` | `~/.lume/serve.json` | Where to find `lume serve` for OTLP |
 | `LUME_INDEX_ARGS` | unset | Extra `lume index` flags, e.g. the Shivvr flags above |
 | `LUME_REINDEX_DEBOUNCE_MS` | `3000` | |
 | `LUME_CONTEXT_HITS` | `3` | Past decisions added as context; `0` turns it off |
@@ -237,16 +249,17 @@ This assumes a running Shivvr (default `http://localhost:8085`).
 
 | | |
 |---|---|
-| Student/teacher loop, guards, training store, calibration | ✅ smoke tests pass against mock backends (Node 24, tsc 7.0.2) |
-| MCP server (stdio) | ✅ |
+| Student/teacher loop, guards, training store, calibration | ✅ smoke tests pass (Node 24, tsc 7.0.2) |
+| Ollaya-compatible HTTP API on :11345, with upstream error codes | ✅ live-tested against Ollaya 0.7.2: student answers identical to direct Ollaya, about 1 s per decide with the cloud teacher |
+| Cloud teacher with local fallback and cloud backfill; `ADDITA_NO_CLOUD` | ✅ |
+| MCP over stdio and streamable HTTP (`/mcp`) | ✅ tested with the official MCP SDK client |
+| `lume.sql_judge` preset | ✅ |
 | Lume log via CLI | ✅ covered by the smoke test when `lume` is installed (lume 0.15.3); skipped otherwise |
-| Ollaya-compatible HTTP API on :11345 | 🚧 in progress |
-| MCP over streamable HTTP (`/mcp`) | 🚧 in progress |
-| OTLP logging to `lume serve` | 🚧 in progress |
-| Guards and logging when both models are down, or `teacher: require` fails | 🚧 in progress |
+| OTLP logging to `lume serve` | ✅ against a mock collector · ⏳ not yet against a live `lume serve` |
+| Guards and logging on HTTP when both models are down | ✅ |
+| Guards and logging on MCP when `teacher: require` fails | 🚧 deferred |
 | Human-only `eval.jsonl`; guard-overridden teacher labels marked in exports | 🚧 in progress |
-| `lume.sql_judge` preset | 🚧 in progress |
-| Tested against live Ollaya | ⏳ not yet; mocks only |
+| Fine-tuning pipeline (Laya, Cloud Run) | 🔬 research |
 
 ## Development
 
@@ -258,7 +271,11 @@ npm test             # build + test/smoke.mjs against mock Ollaya/Ollama
 
 | Path | |
 |---|---|
-| `src/index.ts` | MCP server and tool definitions |
+| `src/index.ts` | Entry point and MCP tool definitions |
+| `src/server.ts` | HTTP server: Ollaya API, passthrough, `/mcp` |
+| `src/mcp.ts` | MCP JSON-RPC server (stdio and HTTP) |
+| `src/validate.ts` | Request validation and Ollaya error codes |
+| `src/otlp.ts` | OTLP logs and metrics to Lume |
 | `src/addita.ts` | The decide loop: student, teacher, guards, storage |
 | `src/ollaya.ts`, `src/ollama.ts` | Backend clients |
 | `src/questions.ts` | Question types, schemas and answer handling |
