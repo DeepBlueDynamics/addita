@@ -1,0 +1,33 @@
+{
+  "name": "addita",
+  "version": "0.1.0",
+  "description": "Addita: MCP server running Ollaya decision models with Ollama as a live teacher; logs training data as it runs",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "npm run build && node test/smoke.mjs",
+    "prepare": "tsc"
+  },
+  "license": "BSD-3-Clause",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  },
+  "type": "module",
+  "bin": {
+    "addita": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "presets",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  }
+}

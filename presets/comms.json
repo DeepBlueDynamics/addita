@@ -1,0 +1,78 @@
+{
+  "description": "VHF marine comms: is it for us, how urgent, what is it, what should we do",
+  "model": "laya",
+  "text_field": "transcript",
+  "questions": {
+    "addressed_to_us": {
+      "type": "noul",
+      "instructions": "The transmission is addressed to our own station, whose callsign is given as own_callsign in the state (or to all stations).",
+      "criteria": {
+        "true": "Calls our callsign, or is an all-stations broadcast",
+        "false": "Addressed to another station, or no addressee"
+      }
+    },
+    "priority": {
+      "type": "choice",
+      "instructions": "What priority does this radio traffic carry?",
+      "criteria": {
+        "distress": "MAYDAY: grave and imminent danger to a vessel or person",
+        "urgency": "PAN-PAN: urgent safety of a vessel or person, not yet distress",
+        "safety": "SECURITE: navigational or weather warning",
+        "routine": "Ordinary operational traffic between stations",
+        "chatter": "Social talk, music, or off-topic use of the channel",
+        "noise": "No intelligible speech, a squelch break or a garbled transcript"
+      }
+    },
+    "intent": {
+      "type": "choice",
+      "instructions": "What does the calling station want?",
+      "criteria": {
+        "hail": "Calling a station to establish contact",
+        "info_request": "Asking for information such as a wind check, position or ETA",
+        "instruction": "Telling the listener to do something",
+        "report": "Giving information: position, status, conditions",
+        "acknowledgement": "Confirming or closing an exchange (roger, out)",
+        "other": "Anything else"
+      }
+    },
+    "action": {
+      "type": "choice",
+      "instructions": "What should our station do with this transmission?",
+      "criteria": {
+        "ignore": "Not for us and not important",
+        "log": "Record it, no response needed",
+        "draft_reply": "Prepare a reply for the operator to send",
+        "alert_operator": "Get a person's attention now"
+      }
+    },
+    "transcript_quality": {
+      "type": "score",
+      "instructions": "How usable is the transcript?",
+      "criteria": [
+        "Unusable: garbled or empty",
+        "Partial: some words are missing or wrong",
+        "Clear: fully readable"
+      ]
+    }
+  },
+  "guards": [
+    {
+      "name": "distress_keyword",
+      "pattern": "\\bmay\\s*day\\b",
+      "flags": "i",
+      "set": { "priority": "distress", "action": "alert_operator" }
+    },
+    {
+      "name": "urgency_keyword",
+      "pattern": "\\bpan[\\s-]*pan\\b",
+      "flags": "i",
+      "set": { "priority": "urgency", "action": "alert_operator" }
+    },
+    {
+      "name": "safety_keyword",
+      "pattern": "\\bs[eé]curit[eé]\\b",
+      "flags": "i",
+      "set": { "priority": "safety" }
+    }
+  ]
+}
