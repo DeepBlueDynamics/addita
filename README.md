@@ -97,6 +97,18 @@ env = { OLLAMA_URL = "http://gpu-box:11434", OLLAMA_MODEL = "qwen3.5:4b" }
 
 ### Docker
 
+With Docker Compose, from the repo root, on a Linux box with an NVIDIA GPU:
+
+```sh
+docker compose up -d --build
+curl -sN localhost:11435/api/pull -d '{"model":"laya"}'   # student models, first run only
+ollama signin                                              # host Ollama, for the cloud teacher
+```
+
+`compose.yml` runs Ollaya in a GPU container and builds Addita with host networking, so Addita uses the Ollama already on the box (`127.0.0.1:11434`) as its teacher. If the box has no Ollama, uncomment the `ollama` service. The first `up` downloads about 1.7 GB of images before it returns.
+
+Or run the Addita image on its own:
+
 ```sh
 docker build -t addita .
 docker run -d --name addita -p 11345:11345 -v addita-data:/data \

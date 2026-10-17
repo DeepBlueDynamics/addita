@@ -1,0 +1,49 @@
+# Addita stack: Ollaya (student) + Addita, using the Ollama already running on the host (teacher).
+# Run from the repo root:
+#   docker compose up -d --build
+# (If you copy this file to a parent directory next to ./addita, change `build: .` to `build: ./addita`.)
+
+services:
+  ollaya:
+    # :cuda requires NVIDIA driver R580+; use :cuda12 for R525-R579.
+    image: ghcr.io/ollaya-dev/ollaya:cuda
+    restart: unless-stopped
+    gpus: all
+    volumes:
+      - ollaya:/home/ollaya/.ollaya
+    ports:
+      - "11435:11435"
+
+  # Uncomment if the host does not already run Ollama on port 11434
+  # (and uncomment `ollama:` under `volumes:` below):
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   restart: unless-stopped
+  #   gpus: all
+  #   volumes:
+  #     - ollama:/root/.ollama
+  #   ports:
+  #     - "11434:11434"
+
+  addita:
+    build: .
+    image: addita:local
+    restart: unless-stopped
+    # Host networking lets Addita reach the host's Ollama on 127.0.0.1:11434
+    # without changing Ollama's bind address, and serves port 11345 on the host.
+    network_mode: host
+    volumes:
+      - addita-data:/data
+    environment:
+      - OLLAYA_URL=http://127.0.0.1:11435
+      - OLLAMA_URL=http://127.0.0.1:11434
+      # Set to "true" to never use a cloud teacher (local qwen3.5:4b only).
+      - ADDITA_NO_CLOUD=false
+    depends_on:
+      ollaya:
+        condition: service_healthy
+
+volumes:
+  ollaya:
+  addita-data:
+  # ollama:
